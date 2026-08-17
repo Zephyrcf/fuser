@@ -26,6 +26,46 @@ use mount_options::check_option_values;
 
 use crate::dev_fuse::DevFuse;
 
+#[cfg(any(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+const FUSERMOUNT_BIN: &str = "fusermount";
+#[cfg(any(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+const FUSERMOUNT3_BIN: &str = "fusermount3";
+#[cfg(any(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+pub(crate) const MOUNT_FUSEFS_BIN: &str = "mount_fusefs";
+
+#[cfg(any(target_os = "linux", fuser_mount_impl = "pure-rust"))]
+pub(crate) fn detect_fusermount_bin() -> io::Result<String> {
+    if let Some(fusermount) = std::env::var_os("FUSERMOUNT_PATH") {
+        return Ok(fusermount
+            .to_str()
+            .expect("FUSERMOUNT_PATH is not UTF-8")
+            .to_owned());
+    }
+
+    let candidates = [
+        FUSERMOUNT3_BIN.to_string(),
+        FUSERMOUNT_BIN.to_string(),
+        MOUNT_FUSEFS_BIN.to_string(),
+        format!("/sbin/{FUSERMOUNT3_BIN}"),
+        format!("/sbin/{FUSERMOUNT_BIN}"),
+        format!("/sbin/{MOUNT_FUSEFS_BIN}"),
+        format!("/bin/{FUSERMOUNT3_BIN}"),
+        format!("/bin/{FUSERMOUNT_BIN}"),
+    ];
+    for name in &candidates {
+        if std::process::Command::new(name).arg("-h").output().is_ok() {
+            return Ok(name.clone());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no FUSE mount helper found, tried {} (set FUSERMOUNT_PATH to override)",
+            candidates.join(", ")
+        ),
+    ))
+}
+
 /// Helper function to provide options as a `fuse_args` struct
 /// (which contains an argc count and an argv pointer)
 #[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
@@ -113,6 +153,20 @@ enum MountImpl {
 }
 
 impl MountImpl {
+    /// Releases the mount without unmounting it.
+    #[cfg(target_os = "linux")]
+    fn disarm(self) {
+        match self {
+            #[cfg(fuser_mount_impl = "pure-rust")]
+            MountImpl::Pure(mount) => mount.disarm(),
+            #[cfg(fuser_mount_impl = "libfuse2")]
+            MountImpl::Fuse2(_) => {}
+            // Dropping only destroys the libfuse session, which does not unmount
+            #[cfg(fuser_mount_impl = "libfuse3")]
+            MountImpl::Fuse3(_) => {}
+        }
+    }
+
     fn umount_impl(&mut self) -> io::Result<()> {
         match self {
             #[cfg(fuser_mount_impl = "pure-rust")]
@@ -202,6 +256,15 @@ impl Mount {
         true
     }
 
+    /// Gives up the mount without unmounting it, for a connection that now
+    /// belongs to another process.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn disarm(mut self) {
+        if let Some(mount) = self.mount_impl.take() {
+            mount.disarm();
+        }
+    }
+
     pub(crate) fn umount(mut self) -> io::Result<()> {
         match self.mount_impl.take() {
             Some(mut mount) => {
@@ -260,6 +323,29 @@ fn libc_umount(mnt: &CStr) -> nix::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn unmount_path_cstr(mountpoint: &CStr) -> io::Result<()> {
+    match libc_umount(mountpoint) {
+        Ok(()) => Ok(()),
+        Err(nix::errno::Errno::EPERM) => fusermount_unmount(&detect_fusermount_bin()?, mountpoint),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Lazily unmount a FUSE filesystem by path.
+///
+/// This is for an adopted FUSE connection whose process did not create the
+/// mount and therefore has no mount handle. The path is used as provided.
+#[cfg(target_os = "linux")]
+pub fn unmount_path(mountpoint: impl AsRef<Path>) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mountpoint = CString::new(mountpoint.as_ref().as_os_str().as_bytes())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    unmount_path_cstr(&mountpoint)
+}
+
 /// Waits (bounded) for the FUSE kernel connection to end after an unmount was
 /// requested. Returns false if the connection is still alive when the timeout
 /// expires, e.g. because a lazily unmounted filesystem is still in use, or an
@@ -287,7 +373,7 @@ pub(crate) fn connection_ended(_fuse_device: &DevFuse, _timeout: std::time::Dura
 /// so that callers do not mistake a still-mounted filesystem for an unmounted
 /// one - BackgroundSession would otherwise wait forever for the session to end.
 #[cfg(any(
-    all(test, target_os = "linux"),
+    target_os = "linux",
     fuser_mount_impl = "pure-rust",
     all(
         fuser_mount_impl = "libfuse2",
@@ -412,6 +498,18 @@ mod test {
         assert!(err.to_string().contains("/nonexistent/fusermount"), "{err}");
         // Helper reports success
         assert!(fusermount_unmount("/bin/true", &mountpoint).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unmount_path_rejects_an_interior_nul() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/mnt/\0bad"));
+        assert_eq!(
+            unmount_path(path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     /// A mount touches the mountpoint, the FUSE device and the mount helper, so "No such

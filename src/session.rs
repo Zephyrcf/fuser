@@ -43,6 +43,8 @@ use crate::mnt::Mount;
 use crate::mnt::mount_options::Config;
 use crate::mnt::mount_options::check_option_conflicts;
 use crate::notify::Notifier;
+#[cfg(target_os = "linux")]
+use crate::pause::SessionPauser;
 use crate::read_buf::FuseReadBuf;
 use crate::reply::Reply;
 use crate::reply::ReplyRaw;
@@ -126,6 +128,22 @@ impl Drop for UmountOnDrop {
     }
 }
 
+/// The outcome of the `FUSE_INIT` handshake of a connection.
+///
+/// The kernel sends `INIT` once per connection, so a successor adopting a
+/// live connection with [`Session::from_initialized_fd`] takes this from the
+/// predecessor's [`Session::init_state`] instead of negotiating again.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitState {
+    /// The protocol version agreed with the kernel.
+    pub proto_version: Version,
+    /// The capabilities agreed with the kernel.
+    pub negotiated: InitFlags,
+    /// Everything the kernel advertised, whether or not it was requested.
+    pub kernel_capabilities: InitFlags,
+}
+
 /// The session data structure
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
@@ -133,6 +151,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) filesystem: FilesystemHolder<FS>,
     /// Communication channel to the kernel driver
     pub(crate) ch: Channel,
+    /// Per-worker cloned devices, opened before any worker starts.
+    cloned_channels: Vec<Channel>,
     /// Handle to the mount.  Dropping this unmounts.
     mount: UmountOnDrop,
     /// Whether to restrict access to owner, root + owner, or unrestricted
@@ -151,6 +171,10 @@ pub struct Session<FS: Filesystem> {
     /// not `negotiated`, says whether the kernel can perform them
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) config: Config,
+    /// Pause/resume control shared with the worker loops, for handing the
+    /// session's fd off to a successor process during a hot upgrade.
+    #[cfg(target_os = "linux")]
+    pub(crate) pause: SessionPauser,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -191,6 +215,7 @@ impl<FS: Filesystem> Session<FS> {
                 fs: Some(filesystem),
             },
             ch,
+            cloned_channels: Vec::new(),
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(Some(mount))),
             },
@@ -200,6 +225,8 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config: options.clone(),
+            #[cfg(target_os = "linux")]
+            pause: SessionPauser::new()?,
         };
 
         session.handshake()?;
@@ -221,6 +248,7 @@ impl<FS: Filesystem> Session<FS> {
                 fs: Some(filesystem),
             },
             ch,
+            cloned_channels: Vec::new(),
             mount: UmountOnDrop {
                 mount: Arc::new(Mutex::new(None)),
             },
@@ -230,6 +258,8 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config,
+            #[cfg(target_os = "linux")]
+            pause: SessionPauser::new()?,
         };
 
         session.handshake()?;
@@ -237,28 +267,147 @@ impl<FS: Filesystem> Session<FS> {
         Ok(session)
     }
 
+    /// Adopts a `/dev/fuse` fd whose connection is already initialized, e.g.
+    /// one handed over by a predecessor in a hot upgrade, using the
+    /// predecessor's [`Session::init_state`] instead of a new `FUSE_INIT`.
+    ///
+    /// The session owns no mount, so it never unmounts; retire the mountpoint
+    /// with [`crate::unmount_path`]. Mounts using `MountOption::AutoUnmount`
+    /// cannot be handed off. Spawn with [`Session::spawn_paused`] to keep the
+    /// handoff reversible.
+    #[cfg(target_os = "linux")]
+    pub fn from_initialized_fd(
+        filesystem: FS,
+        fd: OwnedFd,
+        acl: SessionACL,
+        config: Config,
+        init: InitState,
+    ) -> io::Result<Self> {
+        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
+        Ok(Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch,
+            cloned_channels: Vec::new(),
+            mount: UmountOnDrop {
+                mount: Arc::new(Mutex::new(None)),
+            },
+            allowed: acl,
+            session_owner: geteuid(),
+            proto_version: Some(init.proto_version),
+            negotiated: init.negotiated,
+            kernel_capabilities: init.kernel_capabilities,
+            config,
+            pause: SessionPauser::new()?,
+        })
+    }
+
+    /// Returns the outcome of `FUSE_INIT`, or `None` before the handshake.
+    ///
+    /// A successor adopting this connection passes it to
+    /// [`Session::from_initialized_fd`].
+    #[cfg(target_os = "linux")]
+    pub fn init_state(&self) -> Option<InitState> {
+        self.proto_version.map(|proto_version| InitState {
+            proto_version,
+            negotiated: self.negotiated,
+            kernel_capabilities: self.kernel_capabilities,
+        })
+    }
+
+    /// Returns a cloneable pause/resume/exit control over this session's worker
+    /// loops, for handing the session's fd off to a successor process during
+    /// a hot upgrade.
+    #[cfg(target_os = "linux")]
+    pub fn pauser(&self) -> SessionPauser {
+        self.pause.clone()
+    }
+
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the session is waited for, so that
     /// `Filesystem::destroy` has run when drop returns - except in the cases documented
     /// on [`BackgroundSession`], where the session thread is detached instead.
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
+    pub fn spawn(mut self) -> io::Result<BackgroundSession> {
+        self.prepare_cloned_channels()?;
         let sender = self.ch.sender();
         let fuse_device = self.ch.device();
         let kernel_capabilities = self.kernel_capabilities;
         let kernel_abi = self.proto_version;
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
+        // Register before returning, so the handle never reports a running
+        // session as having no workers
+        #[cfg(target_os = "linux")]
+        let (pauser, n_threads) = {
+            let n_threads = self.config.n_threads.unwrap_or(1);
+            self.pause.register_workers(n_threads);
+            (self.pause.clone(), n_threads)
+        };
         let guard = thread::Builder::new()
             .name("fuser-bg".to_string())
-            .spawn(move || self.run())?;
+            .spawn(move || self.run_registered());
+        #[cfg(target_os = "linux")]
+        if guard.is_err() {
+            pauser.unregister_workers(n_threads);
+        }
         Ok(BackgroundSession {
-            guard: Some(guard),
+            guard: Some(guard?),
             sender,
             fuse_device,
             mount,
             kernel_capabilities,
             kernel_abi,
+            #[cfg(target_os = "linux")]
+            pauser,
         })
+    }
+
+    /// Like [`spawn`](Session::spawn), but every worker parks before its first
+    /// read, and this returns once all of them have. Everything fallible (fd
+    /// clones, threads) is done without consuming a request, so a successor
+    /// can report readiness while the predecessor can still resume. Committing
+    /// is then [`SessionPauser::resume`], which cannot fail; backing out is
+    /// [`SessionPauser::exit`] followed by [`BackgroundSession::join`]:
+    ///
+    /// ```no_run
+    /// # fn example(session: fuser::Session<impl fuser::Filesystem + Send + 'static>)
+    /// # -> std::io::Result<()> {
+    /// let bg = session.spawn_paused(std::time::Duration::from_secs(10))?;
+    /// // tell the predecessor everything stands ready, await its decision
+    /// # let committed = true;
+    /// if committed {
+    ///     bg.pauser().resume();
+    /// } else {
+    ///     bg.pauser().exit();
+    ///     bg.join()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Do not drop the handle while the workers are parked: the drop would
+    /// wait for a session that cannot finish.
+    ///
+    /// # Errors
+    /// Returns an error if anything failed to stand up; the session has then
+    /// been ended without reading a request.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_paused(self, timeout: std::time::Duration) -> io::Result<BackgroundSession> {
+        let expected = self.config.n_threads.unwrap_or(1);
+        let pauser = self.pause.clone();
+        pauser.start_paused();
+        let bg = self.spawn()?;
+        if let Err(err) = pauser.wait_parked(expected, timeout) {
+            // Nothing was read, so ending the workers loses nothing. The
+            // session error says what actually failed, e.g. an fd clone
+            pauser.exit();
+            return Err(match bg.join() {
+                Err(run_err) => run_err,
+                Ok(()) => err,
+            });
+        }
+        Ok(bg)
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -267,10 +416,45 @@ impl<FS: Filesystem> Session<FS> {
     /// may run concurrent by spawning threads.
     /// # Errors
     /// Returns any final error when the session comes to an end.
-    pub fn run(self) -> io::Result<()> {
+    pub fn run(mut self) -> io::Result<()> {
+        self.prepare_cloned_channels()?;
+        #[cfg(target_os = "linux")]
+        self.pause
+            .register_workers(self.config.n_threads.unwrap_or(1));
+        self.run_registered()
+    }
+
+    /// Opens the per-worker cloned devices once, before any worker reads.
+    fn prepare_cloned_channels(&mut self) -> io::Result<()> {
+        let n_threads = self.config.n_threads.unwrap_or(1);
+        if n_threads == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "n_threads must be greater than zero",
+            ));
+        }
+        if !cfg!(target_os = "linux") && n_threads != 1 {
+            // TODO: check whether it works on macOS/FreeBSD and enable if it works.
+            return Err(io::Error::other(
+                "n_threads != 1 is only supported on Linux",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if self.config.clone_fd && self.cloned_channels.is_empty() {
+            self.cloned_channels = (1..n_threads)
+                .map(|_| self.ch.clone_fd())
+                .collect::<io::Result<_>>()?;
+        }
+        Ok(())
+    }
+
+    /// Runs the worker loops, which on Linux must already be registered with
+    /// the pauser.
+    fn run_registered(self) -> io::Result<()> {
         let Session {
             filesystem,
             ch,
+            cloned_channels,
             mount: _do_not_umount_yet,
             allowed,
             session_owner,
@@ -278,44 +462,24 @@ impl<FS: Filesystem> Session<FS> {
             negotiated,
             kernel_capabilities,
             config,
+            #[cfg(target_os = "linux")]
+            pause,
         } = self;
 
         let n_threads = config.n_threads.unwrap_or(1);
 
-        if !cfg!(target_os = "linux") && n_threads != 1 {
-            // TODO: check whether it works on macOS/FreeBSD and enable if it works.
-            return Err(io::Error::other(
-                "n_threads != 1 is only supported on Linux",
-            ));
-        }
-
-        let Some(n_threads_minus_one) = n_threads.checked_sub(1) else {
-            return Err(io::Error::other("n_threads"));
+        let mut channels = if config.clone_fd {
+            cloned_channels
+        } else {
+            vec![ch.clone(); n_threads - 1]
         };
+        channels.push(ch);
 
         let mut filesystem = Arc::new(filesystem);
 
-        let mut channels = Vec::with_capacity(n_threads);
-
-        for _ in 0..n_threads_minus_one {
-            if config.clone_fd {
-                #[cfg(target_os = "linux")]
-                {
-                    channels.push(ch.clone_fd()?);
-                    continue;
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    return Err(io::Error::other("clone_fd is only supported on Linux"));
-                }
-            } else {
-                channels.push(ch.clone());
-            }
-        }
-        channels.push(ch);
-
         let mut threads = Vec::with_capacity(n_threads);
 
+        let mut spawn_error = None;
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
             let event_loop = SessionEventLoop {
@@ -327,12 +491,35 @@ impl<FS: Filesystem> Session<FS> {
                 negotiated,
                 kernel_capabilities,
                 kernel_abi: proto_version,
+                #[cfg(target_os = "linux")]
+                pause: pause.clone(),
             };
-            threads.push(
-                thread::Builder::new()
-                    .name(thread_name)
-                    .spawn(move || event_loop.event_loop())?,
-            );
+            match thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || event_loop.event_loop())
+            {
+                Ok(thread) => threads.push(thread),
+                Err(err) => {
+                    spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = spawn_error {
+            // Stop the workers already running, so nothing waits for the
+            // ones that never started. Elsewhere there is only one worker,
+            // so none is running here.
+            #[cfg(target_os = "linux")]
+            {
+                pause.unregister_workers(n_threads - threads.len());
+                pause.exit();
+            }
+            for thread in threads {
+                if thread.join().is_err() {
+                    warn!("event loop thread panicked");
+                }
+            }
+            return Err(err);
         }
 
         let mut reply: io::Result<()> = Ok(());
@@ -564,18 +751,41 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) negotiated: InitFlags,
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) kernel_abi: Option<Version>,
+    /// Pause/resume control shared across the session's workers, for handing
+    /// the session's fd off to a successor process during a hot upgrade.
+    #[cfg(target_os = "linux")]
+    pub(crate) pause: SessionPauser,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
+    /// Reads and dispatches requests until the session exits or the
+    /// connection ends.
     fn event_loop(&self) -> io::Result<()> {
+        // Non-blocking reads keep the loop interruptible: a worker that lost
+        // the race for a request gets EAGAIN and waits again instead of
+        // blocking in read(2) past a pause request. The exit guard comes
+        // first so that a setup failure still deregisters the worker.
+        #[cfg(target_os = "linux")]
+        let (_exit_guard, waiter) = {
+            let exit_guard = self.pause.worker_exit_guard();
+            crate::pause::set_channel_nonblocking(self.ch.as_fd())?;
+            (exit_guard, self.pause.request_waiter(self.ch.as_fd())?)
+        };
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
         loop {
-            // Read the next request from the given channel to kernel driver
+            // Park while the session is paused; return once it is exiting.
+            // Reaching this point means the previous request was fully
+            // dispatched, so pausing here is a request boundary.
+            #[cfg(target_os = "linux")]
+            if !self.pause.wait_ready() {
+                return Ok(());
+            }
+
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
+            match self.ch.receive(buf) {
                 Ok(size) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
                         // Dispatch request
@@ -596,6 +806,15 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         }
                     }
                 }
+                // No request is queued: wait for one, or for a pause/exit wakeup
+                #[cfg(target_os = "linux")]
+                Err(nix::errno::Errno::EAGAIN) => waiter.wait()?,
+                // ENOENT: interrupted operation, safe to retry. EINTR:
+                // interrupted syscall.
+                Err(nix::errno::Errno::ENOENT) | Err(nix::errno::Errno::EINTR) => continue,
+                // The read blocks here, so EAGAIN only asks to try again
+                #[cfg(not(target_os = "linux"))]
+                Err(nix::errno::Errno::EAGAIN) => continue,
                 // The kernel returns ENODEV when the filesystem was unmounted, or
                 // ECONNABORTED when the connection was aborted with FUSE_ABORT_ERROR
                 // negotiated. Either way the connection is gone: a normal end of the
@@ -635,6 +854,10 @@ pub struct BackgroundSession {
     kernel_capabilities: InitFlags,
     /// The ABI version agreed during init, for notifications with no capability bit
     kernel_abi: Option<Version>,
+    /// Pause/resume control over the worker loops, for handing the session's
+    /// fd off to a successor process during a hot upgrade.
+    #[cfg(target_os = "linux")]
+    pauser: SessionPauser,
 }
 
 /// How long teardown waits for the kernel connection to end after a successful
@@ -682,6 +905,29 @@ impl BackgroundSession {
     /// session has been joined.
     pub fn is_finished(&self) -> bool {
         self.guard.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    /// Returns a cloneable pause/resume/exit control over the session's worker
+    /// loops, for handing the session's fd off to a successor process during
+    /// a hot upgrade.
+    #[cfg(target_os = "linux")]
+    pub fn pauser(&self) -> SessionPauser {
+        self.pauser.clone()
+    }
+
+    /// Retires this session once a successor serves its connection: gives up
+    /// the mount without unmounting it, then ends and joins the workers. Use
+    /// this instead of a drop or [`umount_and_join`](Self::umount_and_join),
+    /// which would unmount the successor's mount. A mount using
+    /// `MountOption::AutoUnmount` cannot be kept, since its watcher unmounts
+    /// when this process exits.
+    #[cfg(target_os = "linux")]
+    pub fn finish_handoff(mut self) -> io::Result<()> {
+        if let Some(mount) = self.mount.take() {
+            mount.disarm();
+        }
+        self.pauser.exit();
+        self.join_impl()
     }
 
     fn join_impl(&mut self) -> io::Result<()> {
@@ -799,6 +1045,178 @@ mod test {
                 .arg(&mountpoint)
                 .status();
         }
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// A session spawned paused stands everything up - fd clones, worker
+    /// threads - without reading a single request: a caller blocks until the
+    /// resume, and the filesystem sees nothing. That is what lets a successor
+    /// confirm readiness before the handoff is committed.
+    #[test]
+    fn spawn_paused_reads_nothing_until_resumed() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+
+        struct Counting {
+            lookups: Arc<AtomicUsize>,
+        }
+        impl Filesystem for Counting {
+            fn lookup(
+                &self,
+                _req: &Request,
+                _parent: INodeNo,
+                _name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                reply.error(Errno::ENOENT);
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let session = Session::new(
+            Counting {
+                lookups: lookups.clone(),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+
+        let bg = session.spawn_paused(Duration::from_secs(10)).unwrap();
+
+        let client_path = mountpoint.join("waiting");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "a parked worker must not have read the request"
+        );
+        assert!(!client.is_finished(), "the caller must still be blocked");
+
+        bg.pauser().resume();
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the resumed session answers the lookup with ENOENT");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(lookups.load(Ordering::SeqCst) > 0);
+
+        bg.umount_and_join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// The whole handoff on a live mount: the predecessor pauses, a successor
+    /// adopts the fd and resumes, and the predecessor retires without taking
+    /// the mount with it. The successor serves until the mount is unmounted.
+    #[test]
+    fn handoff_keeps_the_mount_served() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+
+        struct Counting {
+            lookups: Arc<AtomicUsize>,
+        }
+        impl Filesystem for Counting {
+            fn lookup(
+                &self,
+                _req: &Request,
+                _parent: INodeNo,
+                _name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                reply.error(Errno::ENOENT);
+            }
+        }
+        let lookup = |mountpoint: &Path| {
+            let err = std::fs::metadata(mountpoint.join("probe")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        };
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let old_lookups = Arc::new(AtomicUsize::new(0));
+        let session = Session::new(
+            Counting {
+                lookups: old_lookups.clone(),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+        let init = session.init_state().unwrap();
+        let fd = session.as_fd().try_clone_to_owned().unwrap();
+        let predecessor = session.spawn().unwrap();
+        lookup(&mountpoint);
+
+        predecessor.pauser().pause(Duration::from_secs(10)).unwrap();
+        let new_lookups = Arc::new(AtomicUsize::new(0));
+        let successor = Session::from_initialized_fd(
+            Counting {
+                lookups: new_lookups.clone(),
+            },
+            fd,
+            SessionACL::Owner,
+            Config::default(),
+            init,
+        )
+        .unwrap()
+        .spawn_paused(Duration::from_secs(10))
+        .unwrap();
+        successor.pauser().resume();
+        predecessor.finish_handoff().unwrap();
+
+        let served_before = old_lookups.load(Ordering::SeqCst);
+        lookup(&mountpoint);
+        assert_eq!(old_lookups.load(Ordering::SeqCst), served_before);
+        assert!(new_lookups.load(Ordering::SeqCst) > 0);
+
+        crate::unmount_path(&mountpoint).unwrap();
+        successor.join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// Backing out of a session spawned paused ends it as if nothing was
+    /// spawned: exit and join return cleanly and the mount is gone with
+    /// them, without a request having been read.
+    #[test]
+    fn spawn_paused_abort_stands_down_cleanly() {
+        use std::time::Duration;
+
+        struct Refusing;
+        impl Filesystem for Refusing {}
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let session = Session::new(Refusing, &mountpoint, &Config::default()).unwrap();
+        let bg = session.spawn_paused(Duration::from_secs(10)).unwrap();
+        bg.pauser().exit();
+        bg.join().unwrap();
+
+        // The mount teardown has run: the mountpoint is a plain directory again
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        assert!(
+            !mounts
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == mountpoint.to_str()),
+            "nothing must remain mounted after an abort"
+        );
         ManuallyDrop::into_inner(tmp);
     }
 

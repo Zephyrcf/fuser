@@ -27,7 +27,7 @@ impl Channel {
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
-    fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
+    pub(crate) fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
         nix::unistd::read(&self.0, buffer)
     }
 
