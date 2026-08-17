@@ -20,6 +20,10 @@ use log::debug;
 use log::error;
 use log::info;
 use log::warn;
+use nix::poll::PollFd;
+use nix::poll::PollFlags;
+use nix::poll::PollTimeout;
+use nix::poll::poll;
 use nix::unistd::Uid;
 use nix::unistd::geteuid;
 use parking_lot::Mutex;
@@ -43,6 +47,7 @@ use crate::mnt::Mount;
 use crate::mnt::mount_options::Config;
 use crate::mnt::mount_options::check_option_conflicts;
 use crate::notify::Notifier;
+use crate::pause::SessionPauser;
 use crate::read_buf::FuseReadBuf;
 use crate::reply::Reply;
 use crate::reply::ReplyRaw;
@@ -151,6 +156,9 @@ pub struct Session<FS: Filesystem> {
     /// not `negotiated`, says whether the kernel can perform them
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) config: Config,
+    /// Pause/resume control shared with the worker loops, for handing the
+    /// session's fd off to a successor process during a hot upgrade.
+    pub(crate) pause: SessionPauser,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -200,6 +208,7 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config: options.clone(),
+            pause: SessionPauser::new()?,
         };
 
         session.handshake()?;
@@ -230,11 +239,83 @@ impl<FS: Filesystem> Session<FS> {
             negotiated: InitFlags::empty(),
             kernel_capabilities: InitFlags::empty(),
             config,
+            pause: SessionPauser::new()?,
         };
 
         session.handshake()?;
 
         Ok(session)
+    }
+
+    /// Wrap an existing, already-initialized /dev/fuse file descriptor -
+    /// e.g. one received from a predecessor process during a hot upgrade -
+    /// skipping the `FUSE_INIT` handshake. The kernel sends `INIT` exactly
+    /// once per connection, so a session adopting a live connection must
+    /// inject the previously negotiated protocol version and init flags
+    /// (see [`Session::proto_version`], [`Session::negotiated_init_flags`]
+    /// and [`Session::kernel_init_flags`] on the predecessor's session)
+    /// instead of waiting for them. This doesn't mount the filesystem
+    /// anywhere; the adopted connection's existing mount keeps serving.
+    ///
+    /// The session has no mount handle, so ending it never unmounts: the
+    /// caller unmounts by path when it retires the mountpoint. Handing off
+    /// a mount that was mounted with `MountOption::AutoUnmount` is not
+    /// supported: its fusermount watcher unmounts as soon as the
+    /// predecessor exits.
+    pub fn from_initialized_fd(
+        filesystem: FS,
+        fd: OwnedFd,
+        acl: SessionACL,
+        config: Config,
+        proto_version: Version,
+        negotiated: InitFlags,
+        kernel_capabilities: InitFlags,
+    ) -> io::Result<Self> {
+        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
+        Ok(Session {
+            filesystem: FilesystemHolder {
+                fs: Some(filesystem),
+            },
+            ch,
+            mount: UmountOnDrop {
+                mount: Arc::new(Mutex::new(None)),
+            },
+            allowed: acl,
+            session_owner: geteuid(),
+            proto_version: Some(proto_version),
+            negotiated,
+            kernel_capabilities,
+            config,
+            pause: SessionPauser::new()?,
+        })
+    }
+
+    /// The FUSE protocol version negotiated with the kernel; `Some` once the
+    /// `FUSE_INIT` handshake has completed (or was injected via
+    /// [`Session::from_initialized_fd`]).
+    pub fn proto_version(&self) -> Option<Version> {
+        self.proto_version
+    }
+
+    /// The capabilities agreed with the kernel during `FUSE_INIT`, needed by
+    /// a successor session adopting this session's connection via
+    /// [`Session::from_initialized_fd`].
+    pub fn negotiated_init_flags(&self) -> InitFlags {
+        self.negotiated
+    }
+
+    /// Everything the kernel advertised during `FUSE_INIT`, whether or not
+    /// it was requested, needed by a successor session adopting this
+    /// session's connection via [`Session::from_initialized_fd`].
+    pub fn kernel_init_flags(&self) -> InitFlags {
+        self.kernel_capabilities
+    }
+
+    /// A cloneable pause/resume/exit control over this session's worker
+    /// loops, for handing the session's fd off to a successor process during
+    /// a hot upgrade.
+    pub fn pauser(&self) -> SessionPauser {
+        self.pause.clone()
     }
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
@@ -246,8 +327,9 @@ impl<FS: Filesystem> Session<FS> {
         let fuse_device = self.ch.device();
         let kernel_capabilities = self.kernel_capabilities;
         let kernel_abi = self.proto_version;
+        let pauser = self.pause.clone();
         // Take the fuse_session, so that we can unmount it
-        let mount = std::mem::take(&mut *self.mount.mount.lock());
+        let mount = Arc::new(Mutex::new(std::mem::take(&mut *self.mount.mount.lock())));
         let guard = thread::Builder::new()
             .name("fuser-bg".to_string())
             .spawn(move || self.run())?;
@@ -258,6 +340,7 @@ impl<FS: Filesystem> Session<FS> {
             mount,
             kernel_capabilities,
             kernel_abi,
+            pauser,
         })
     }
 
@@ -278,6 +361,7 @@ impl<FS: Filesystem> Session<FS> {
             negotiated,
             kernel_capabilities,
             config,
+            pause,
         } = self;
 
         let n_threads = config.n_threads.unwrap_or(1);
@@ -316,6 +400,10 @@ impl<FS: Filesystem> Session<FS> {
 
         let mut threads = Vec::with_capacity(n_threads);
 
+        // Register all workers before spawning any, so a pause issued right
+        // after spawn already knows how many workers to wait for.
+        pause.register_workers(n_threads);
+
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
             let event_loop = SessionEventLoop {
@@ -327,6 +415,7 @@ impl<FS: Filesystem> Session<FS> {
                 negotiated,
                 kernel_capabilities,
                 kernel_abi: proto_version,
+                pause: pause.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -564,18 +653,62 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) negotiated: InitFlags,
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) kernel_abi: Option<Version>,
+    /// Pause/resume control shared across the session's workers, for handing
+    /// the session's fd off to a successor process during a hot upgrade.
+    pub(crate) pause: SessionPauser,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
     fn event_loop(&self) -> io::Result<()> {
+        let _exit_guard = self.pause.worker_exit_guard();
+        // Non-blocking reads keep the loop interruptible: a worker that lost
+        // a poll race (all workers of a connection wake for one request)
+        // gets EAGAIN and returns to poll instead of blocking in read(2)
+        // past a pause request.
+        crate::pause::set_channel_nonblocking(self.ch.as_fd())?;
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
         let buf = buf.as_mut();
         loop {
+            // Park while the session is paused; return once it is exiting.
+            // Reaching this point means the previous request was fully
+            // dispatched, so pausing here is a request boundary.
+            if !self.pause.wait_ready() {
+                return Ok(());
+            }
+
+            // Wait for a request or a pause/exit wakeup.
+            let mut fds = [
+                PollFd::new(self.ch.as_fd(), PollFlags::POLLIN),
+                PollFd::new(self.pause.wake_fd(), PollFlags::POLLIN),
+            ];
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(err) => return Err(err.into()),
+            }
+            if fds[1]
+                .revents()
+                .unwrap_or(PollFlags::empty())
+                .contains(PollFlags::POLLIN)
+            {
+                // Pause or exit requested; re-check the state at the top.
+                continue;
+            }
+            // POLLERR/POLLHUP mean the connection is gone; fall through to
+            // receive() so ENODEV ends the session normally.
+            if !fds[0]
+                .revents()
+                .unwrap_or(PollFlags::empty())
+                .intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP)
+            {
+                continue;
+            }
+
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
+            match self.ch.receive(buf) {
                 Ok(size) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
                         // Dispatch request
@@ -596,6 +729,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         }
                     }
                 }
+                // ENOENT: interrupted operation, safe to retry. EINTR:
+                // interrupted syscall. EAGAIN: another worker won the race
+                // for this request. All return to poll.
+                Err(nix::errno::Errno::ENOENT)
+                | Err(nix::errno::Errno::EINTR)
+                | Err(nix::errno::Errno::EAGAIN) => continue,
                 // The kernel returns ENODEV when the filesystem was unmounted, or
                 // ECONNABORTED when the connection was aborted with FUSE_ABORT_ERROR
                 // negotiated. Either way the connection is gone: a normal end of the
@@ -629,12 +768,15 @@ pub struct BackgroundSession {
     /// The FUSE device fd of the session's kernel connection
     fuse_device: Arc<DevFuse>,
     /// Ensures the filesystem is unmounted when the session ends
-    mount: Option<Mount>,
+    mount: Arc<Mutex<Option<Mount>>>,
     /// Everything the kernel advertised during init, for notifications whose support
     /// depends on it
     kernel_capabilities: InitFlags,
     /// The ABI version agreed during init, for notifications with no capability bit
     kernel_abi: Option<Version>,
+    /// Pause/resume control over the worker loops, for handing the session's
+    /// fd off to a successor process during a hot upgrade.
+    pauser: SessionPauser,
 }
 
 /// How long teardown waits for the kernel connection to end after a successful
@@ -648,7 +790,7 @@ impl BackgroundSession {
     /// Unmount the filesystem and join the background thread, returning the
     /// session result. `Filesystem::destroy` has run when this returns.
     pub fn umount_and_join(mut self) -> io::Result<()> {
-        if let Some(mount) = self.mount.take() {
+        if let Some(mount) = self.mount.lock().take() {
             if let Err(err) = mount.umount() {
                 // The filesystem is still mounted and the session still running,
                 // so joining would block indefinitely; leave the thread detached,
@@ -675,6 +817,24 @@ impl BackgroundSession {
         self.join_impl()
     }
 
+    /// A cloneable pause/resume/exit control over the session's worker
+    /// loops, for handing the session's fd off to a successor process during
+    /// a hot upgrade.
+    pub fn pauser(&self) -> SessionPauser {
+        self.pauser.clone()
+    }
+
+    /// A handle that can permanently disarm the mount teardown: after
+    /// handing the connection to a successor during a hot upgrade, this
+    /// process must never unmount - the mountpoint belongs to the successor
+    /// and the mount device number cannot tell the two apart because the
+    /// connection never changed.
+    pub fn mount_disarmer(&self) -> MountDisarmer {
+        MountDisarmer {
+            mount: Arc::clone(&self.mount),
+        }
+    }
+
     fn join_impl(&mut self) -> io::Result<()> {
         let Some(guard) = self.guard.take() else {
             return Ok(());
@@ -696,7 +856,7 @@ impl Drop for BackgroundSession {
         // has run by the time drop returns (issues #239 and #411). Without the
         // join, the process could exit before the detached session thread got
         // around to calling destroy
-        let Some(mount) = self.mount.take() else {
+        let Some(mount) = self.mount.lock().take() else {
             // No mount to remove (Session::from_fd): nothing here can end the
             // session, so joining could block forever; leave the thread detached
             return;
@@ -716,6 +876,27 @@ impl Drop for BackgroundSession {
         }
         if let Err(err) = self.join_impl() {
             warn!("Session ended with an error during drop: {err}");
+        }
+    }
+}
+
+/// Permanently disarms a [`BackgroundSession`]'s mount teardown. See
+/// [`BackgroundSession::mount_disarmer`].
+///
+/// Note that disarming cannot protect a mount that was mounted with
+/// `MountOption::AutoUnmount`: its fusermount watcher unmounts as soon as
+/// this process exits, so such mounts cannot be handed off.
+#[derive(Clone, Debug)]
+pub struct MountDisarmer {
+    mount: Arc<Mutex<Option<Mount>>>,
+}
+
+impl MountDisarmer {
+    /// Takes the mount handle and leaks it so neither a drop nor an explicit
+    /// unmount can ever detach the (now successor-owned) mount.
+    pub fn disarm(&self) {
+        if let Some(mount) = self.mount.lock().take() {
+            std::mem::forget(mount);
         }
     }
 }

@@ -1,6 +1,16 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add hot-upgrade support: a daemon can hand its live `/dev/fuse` connection to a successor
+  process without interrupting the mount. `Session::pauser()` / `BackgroundSession::pauser()`
+  return a `SessionPauser` that stops the worker loops at a request boundary (`pause()`),
+  restarts them (`resume()`) if the takeover fails, or ends them without unmounting (`exit()`).
+  The successor adopts the fd with `Session::from_initialized_fd()`, injecting the protocol
+  version and init flags the predecessor reports via `Session::proto_version()`,
+  `Session::negotiated_init_flags()` and `Session::kernel_init_flags()`. After a successful
+  handoff the predecessor calls `BackgroundSession::mount_disarmer()` and disarms its automatic
+  unmount, which now belongs to nobody: the successor's caller unmounts by path when it
+  retires the mountpoint. Mounts using `MountOption::AutoUnmount` cannot be handed off
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap
