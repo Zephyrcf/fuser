@@ -121,6 +121,11 @@ impl<'a> Notification<'a> {
         Self::Bare(NotificationBuf::new())
     }
 
+    /// No payload either: the kernel's handler takes only the connection
+    pub(crate) fn new_resend() -> Self {
+        Self::Bare(NotificationBuf::new())
+    }
+
     pub(crate) fn new_poll(kh: PollHandle) -> Self {
         let r = abi::fuse_notify_poll_wakeup_out { kh: kh.0 };
         Self::from_struct(&r)
@@ -242,6 +247,19 @@ mod test {
             .unwrap();
         let expected = vec![
             0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(n, expected);
+    }
+
+    /// Like `inc_epoch`, nothing but a header, this one carrying code 7.
+    #[test]
+    fn resend() {
+        let n = Notification::new_resend()
+            .with_iovec(abi::fuse_notify_code::FUSE_NOTIFY_RESEND, ioslice_to_vec)
+            .unwrap();
+        let expected = vec![
+            0x10, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
         ];
         assert_eq!(n, expected);

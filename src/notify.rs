@@ -7,6 +7,9 @@ use std::io;
 use crate::INodeNo;
 use crate::Version;
 use crate::channel::ChannelSender;
+use crate::ll::Errno;
+use crate::ll::RequestId;
+use crate::ll::ResponseErrno;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi::FUSE_EXPIRE_ONLY;
 use crate::ll::fuse_abi::FUSE_KERNEL_MINOR_VERSION;
@@ -14,6 +17,20 @@ use crate::ll::fuse_abi::FUSE_KERNEL_VERSION;
 use crate::ll::fuse_abi::FUSE_NOTIFY_INC_EPOCH_VERSION;
 use crate::ll::fuse_abi::fuse_notify_code as notify_code;
 use crate::ll::notify::Notification;
+use crate::ll::reply::Response;
+
+/// How [`Notifier::recover_inflight`] unblocked the callers of the requests a dead
+/// predecessor read but never answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightRecovery {
+    /// The kernel redelivers every such request itself, to be served normally; nothing
+    /// was lost. Requests may reach the filesystem twice, marked with
+    /// [`Request::is_resend`](crate::Request::is_resend).
+    Resent,
+    /// The kernel is too old to resend, so the journaled requests were answered with an
+    /// error instead, this many of them still being open. The callers unblock and retry.
+    ErroredOut(usize),
+}
 
 /// A handle to a pending `poll()` request.
 #[derive(Copy, Clone, Debug)]
@@ -164,6 +181,81 @@ impl Notifier {
         self.send(notify_code::FUSE_NOTIFY_INC_EPOCH, &notif)
     }
 
+    /// Ask the kernel to deliver again every request it has handed out but not yet had
+    /// answered.
+    ///
+    /// This is the crash-failover complement to the graceful handoff of
+    /// [`Session::from_initialized_fd`](crate::Session::from_initialized_fd): a predecessor
+    /// that died mid-request read requests off the connection that nothing will ever answer,
+    /// leaving their callers blocked. The kernel moves everything in that state back to the
+    /// pending queue, where the successor's session loop reads them like any other request,
+    /// marked as redelivered ([`Request::is_resend`](crate::Request::is_resend)).
+    ///
+    /// [`recover_inflight`](Self::recover_inflight) wraps this with a fallback for
+    /// kernels that cannot, and is what a failover path is usually after.
+    ///
+    /// The requests were possibly already acted on before the predecessor died, so the
+    /// filesystem must cope with executing them twice; for non-idempotent operations that
+    /// takes deduplication on the filesystem's side. After a graceful pause-and-handoff
+    /// nothing is in flight and there is nothing to resend.
+    ///
+    /// # Errors
+    /// Returns `ENOTSUP` if the kernel did not advertise `InitFlags::FUSE_HAS_RESEND`
+    /// (ABI 7.40): such a kernel has no handler for the code and would answer `EINVAL`,
+    /// which says nothing about why. There the successor can still unblock the stranded
+    /// callers with [`Session::reply_error`](crate::Session::reply_error), given the
+    /// request ids from a journal the predecessor kept.
+    /// Returns an error if the kernel rejects the notification.
+    pub fn resend(&self) -> io::Result<()> {
+        if !self
+            .kernel_capabilities
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+        let notif = Notification::new_resend();
+        self.send(notify_code::FUSE_NOTIFY_RESEND, &notif)
+    }
+
+    /// Unblock the callers of every request a dead predecessor read but never answered,
+    /// the way the kernel allows: by asking it to [`resend`](Self::resend) them where it
+    /// can (kernel 6.9+), and by answering the journaled ids with `error` where it
+    /// cannot, as [`Session::reply_error`](crate::Session::reply_error) does. The
+    /// returned [`InflightRecovery`] says which of the two happened.
+    ///
+    /// `journaled` is every request id the predecessor read and had not answered, as
+    /// recorded by a journal it kept; ids it answered after all are ignored. A kernel
+    /// that resends does not consult the journal, so a filesystem may pass an empty one
+    /// where it keeps none - but then there is no fallback, and callers on an older
+    /// kernel stay blocked.
+    ///
+    /// # Errors
+    /// Returns an error if the kernel rejects the resend notification for any reason
+    /// other than not supporting it, or rejects one of the replies for any reason other
+    /// than the request already being complete.
+    pub fn recover_inflight<I>(&self, journaled: I, error: Errno) -> io::Result<InflightRecovery>
+    where
+        I: IntoIterator<Item = RequestId>,
+    {
+        match self.resend() {
+            Ok(()) => return Ok(InflightRecovery::Resent),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
+            Err(e) => return Err(e),
+        }
+        let mut open = 0;
+        for unique in journaled {
+            let sent = ResponseErrno(error).with_iovec(unique, |iov| self.sender.send(iov));
+            match sent {
+                Ok(()) => open += 1,
+                // Already complete: answered by the predecessor but not struck from
+                // the journal before the crash
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(InflightRecovery::ErroredOut(open))
+    }
+
     /// What the connection actually speaks: the lower of what the kernel offered during init
     /// and what this crate replied with.
     ///
@@ -273,6 +365,38 @@ mod test {
         notifier(InitFlags::FUSE_HAS_EXPIRE_ONLY)
             .expire_entry(INodeNo::ROOT, OsStr::new("x"))
             .unwrap();
+    }
+
+    /// A kernel that never advertised resending has no handler for the notification and
+    /// answers `EINVAL`, so the request is refused here with something more telling.
+    #[test]
+    fn resend_refused_without_kernel_support() {
+        let err = notifier(InitFlags::empty()).resend().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTSUP));
+    }
+
+    #[test]
+    fn resend_sent_with_kernel_support() {
+        notifier(InitFlags::FUSE_HAS_RESEND).resend().unwrap();
+    }
+
+    /// A kernel that resends handles everything itself: the journal is not consulted.
+    #[test]
+    fn recover_inflight_resends_where_the_kernel_can() {
+        let recovery = notifier(InitFlags::FUSE_HAS_RESEND)
+            .recover_inflight([crate::ll::RequestId(42)], crate::Errno::EIO)
+            .unwrap();
+        assert_eq!(recovery, InflightRecovery::Resent);
+    }
+
+    /// Without resend the journal is what there is; nothing journaled means nothing
+    /// to answer, and the count says so.
+    #[test]
+    fn recover_inflight_falls_back_to_the_journal() {
+        let recovery = notifier(InitFlags::empty())
+            .recover_inflight([], crate::Errno::EIO)
+            .unwrap();
+        assert_eq!(recovery, InflightRecovery::ErroredOut(0));
     }
 
     /// Invalidating is unconditional: it does not depend on the expire capability.

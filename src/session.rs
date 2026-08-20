@@ -43,6 +43,7 @@ use crate::ll::ResponseErrno;
 use crate::ll::Version;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi as abi;
+use crate::ll::reply::Response;
 use crate::mnt::Mount;
 use crate::mnt::mount_options::Config;
 use crate::mnt::mount_options::check_option_conflicts;
@@ -262,6 +263,10 @@ impl<FS: Filesystem> Session<FS> {
     /// a mount that was mounted with `MountOption::AutoUnmount` is not
     /// supported: its fusermount watcher unmounts as soon as the
     /// predecessor exits.
+    ///
+    /// If the predecessor died rather than pausing, requests it had read
+    /// but not answered are stranded; [`crate::Notifier::resend`] asks the
+    /// kernel to deliver them again.
     pub fn from_initialized_fd(
         filesystem: FS,
         fd: OwnedFd,
@@ -316,6 +321,28 @@ impl<FS: Filesystem> Session<FS> {
     /// a hot upgrade.
     pub fn pauser(&self) -> SessionPauser {
         self.pause.clone()
+    }
+
+    /// Complete an outstanding request with an error, identified by its id alone.
+    ///
+    /// The kernel matches a reply to a request by the id, without regard to which process
+    /// on the connection wrote it. That lets a successor adopting a dead predecessor's
+    /// connection (see [`Session::from_initialized_fd`]) unblock the callers of requests
+    /// the predecessor read but never answered, on a kernel too old for
+    /// [`crate::Notifier::resend`]: the predecessor journals each request id it reads and
+    /// strikes it when it replies, and the successor answers whatever the journal says is
+    /// still open. The error is all a successor can say, having only the id and not the
+    /// request; the caller retries and the retry is served normally.
+    /// [`crate::Notifier::recover_inflight`] drives this and the resend from one entry
+    /// point, preferring the resend where the kernel offers it.
+    ///
+    /// # Errors
+    /// Returns `ENOENT` if the kernel has no such request in flight - it was already
+    /// completed, which for a journal replayed after a crash is the expected case for
+    /// entries the predecessor answered but did not strike.
+    /// Returns an error if the kernel rejects the reply.
+    pub fn reply_error(&self, unique: ll::RequestId, error: Errno) -> io::Result<()> {
+        ResponseErrno(error).with_iovec(unique, |iov| self.ch.sender().send(iov))
     }
 
     /// Run the session loop in a background thread. If the returned handle is dropped,
@@ -817,6 +844,16 @@ impl BackgroundSession {
         self.join_impl()
     }
 
+    /// Complete an outstanding request with an error, identified by its id alone.
+    /// See [`Session::reply_error`].
+    ///
+    /// # Errors
+    /// Returns `ENOENT` if the kernel has no such request in flight.
+    /// Returns an error if the kernel rejects the reply.
+    pub fn reply_error(&self, unique: ll::RequestId, error: Errno) -> io::Result<()> {
+        ResponseErrno(error).with_iovec(unique, |iov| self.sender.send(iov))
+    }
+
     /// A cloneable pause/resume/exit control over the session's worker
     /// loops, for handing the session's fd off to a successor process during
     /// a hot upgrade.
@@ -971,6 +1008,407 @@ mod test {
                 .arg(&mountpoint)
                 .status();
         }
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// A predecessor that crashed mid-request read requests off the connection that nothing
+    /// will ever answer. A successor adopting the connection asks for them back with
+    /// [`Notifier::resend`], and the kernel delivers them again with the resend mark set.
+    /// Pinned against a real kernel: the redelivery and the mark are its behavior.
+    #[test]
+    fn resend_redelivers_inflight_requests_to_a_successor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use std::time::SystemTime;
+
+        use crate::FileAttr;
+        use crate::FileType;
+        use crate::INodeNo;
+
+        fn directory_attr(ino: INodeNo) -> FileAttr {
+            FileAttr {
+                ino,
+                size: 0,
+                blocks: 0,
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                kind: FileType::Directory,
+                perm: 0o777,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            }
+        }
+
+        /// Reads the lookup and then hangs, standing in for a process that died with the
+        /// request in hand. Released at the end of the test so its worker can exit; the
+        /// answer it then sends belongs to a request the successor already completed, and
+        /// the kernel discards it.
+        struct Predecessor {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Predecessor {
+            fn lookup(
+                &self,
+                _req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                // Only the test's own lookup hangs: anything else probing the
+                // mountpoint (desktop indexers do) is answered right away,
+                // rather than wedging the single worker on it
+                if name != "inflight" {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.entered.send(()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        struct Successor {
+            saw_resend: Arc<Mutex<Option<bool>>>,
+        }
+        impl Filesystem for Successor {
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                if name == "inflight" {
+                    *self.saw_resend.lock() = Some(req.is_resend());
+                }
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let session = Session::new(
+            Predecessor {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+
+        if !session
+            .kernel_init_flags()
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            eprintln!(
+                "skipping resend_redelivers_inflight_requests_to_a_successor: kernel does not advertise FUSE_HAS_RESEND"
+            );
+            drop(session);
+            ManuallyDrop::into_inner(tmp);
+            return;
+        }
+
+        let successor_fd = session.as_fd().try_clone_to_owned().unwrap();
+        let proto_version = session.proto_version().unwrap();
+        let negotiated = session.negotiated_init_flags();
+        let kernel_capabilities = session.kernel_init_flags();
+        let predecessor = session.spawn().unwrap();
+
+        let client_path = mountpoint.join("inflight");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let saw_resend = Arc::new(Mutex::new(None));
+        let successor = Session::from_initialized_fd(
+            Successor {
+                saw_resend: saw_resend.clone(),
+            },
+            successor_fd,
+            SessionACL::All,
+            Config::default(),
+            proto_version,
+            negotiated,
+            kernel_capabilities,
+        )
+        .unwrap()
+        .spawn()
+        .unwrap();
+        successor.notifier().resend().unwrap();
+
+        // The predecessor's worker is still stuck in lookup(), so this answer proves the
+        // kernel delivered the request a second time and the successor completed it
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the successor answers the resent lookup with ENOENT");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            *saw_resend.lock(),
+            Some(true),
+            "the redelivered request must carry the resend mark"
+        );
+
+        release_tx.send(()).unwrap();
+        predecessor.umount_and_join().unwrap();
+        successor.join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// On a kernel too old for resend, a successor can still unblock the callers of
+    /// requests a dead predecessor read but never answered, by answering the journaled
+    /// request ids itself: the kernel matches a reply to a request by the id alone,
+    /// whoever writes it. Pinned against a real kernel: the matching is its behavior,
+    /// on every version.
+    #[test]
+    fn reply_error_completes_a_request_read_by_someone_else() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use std::time::SystemTime;
+
+        use crate::FileAttr;
+        use crate::FileType;
+        use crate::INodeNo;
+
+        /// Journals the id of the lookup it reads and then hangs, standing in for a
+        /// process that died with the request in hand.
+        struct Journaling {
+            read: mpsc::Sender<ll::RequestId>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Journaling {
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                // Only the test's own lookup hangs: anything else probing the
+                // mountpoint (desktop indexers do) is answered right away,
+                // rather than wedging the single worker on it
+                if name != "stranded" {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.read.send(req.unique()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(
+                    &Duration::from_secs(0),
+                    &FileAttr {
+                        ino,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::UNIX_EPOCH,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        ctime: SystemTime::UNIX_EPOCH,
+                        crtime: SystemTime::UNIX_EPOCH,
+                        kind: FileType::Directory,
+                        perm: 0o777,
+                        nlink: 2,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        blksize: 512,
+                        flags: 0,
+                    },
+                );
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let bg = Session::new(
+            Journaling {
+                read: read_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap()
+        .spawn()
+        .unwrap();
+
+        let client_path = mountpoint.join("stranded");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        let unique = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // The worker is stuck in lookup(), so this answer is what unblocks the caller
+        bg.reply_error(unique, Errno::EIO).unwrap();
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the reply by id answers the stranded lookup with EIO");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        // The request is gone once answered, which is what a journal replayed after a
+        // crash sees for the entries the predecessor answered but did not strike
+        let err = bg.reply_error(unique, Errno::EIO).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        release_tx.send(()).unwrap();
+        bg.umount_and_join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// The one failover entry point: recover_inflight() resends where the kernel can and
+    /// answers the journal where it cannot. This exercises the fallback on a kernel
+    /// without resend; `resend_redelivers_inflight_requests_to_a_successor` exercises the
+    /// other path on a kernel with it.
+    #[test]
+    fn recover_inflight_answers_the_journal_without_resend() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use std::time::SystemTime;
+
+        use crate::FileAttr;
+        use crate::FileType;
+        use crate::INodeNo;
+        use crate::InflightRecovery;
+
+        struct Journaling {
+            read: mpsc::Sender<ll::RequestId>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Journaling {
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                // Only the test's own lookup hangs: anything else probing the
+                // mountpoint (desktop indexers do) is answered right away,
+                // rather than wedging the single worker on it
+                if name != "stranded" {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.read.send(req.unique()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(
+                    &Duration::from_secs(0),
+                    &FileAttr {
+                        ino,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::UNIX_EPOCH,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        ctime: SystemTime::UNIX_EPOCH,
+                        crtime: SystemTime::UNIX_EPOCH,
+                        kind: FileType::Directory,
+                        perm: 0o777,
+                        nlink: 2,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        blksize: 512,
+                        flags: 0,
+                    },
+                );
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let session = Session::new(
+            Journaling {
+                read: read_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+
+        if session
+            .kernel_init_flags()
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            eprintln!(
+                "skipping recover_inflight_answers_the_journal_without_resend: this kernel resends"
+            );
+            drop(session);
+            ManuallyDrop::into_inner(tmp);
+            return;
+        }
+        let bg = session.spawn().unwrap();
+
+        let client_path = mountpoint.join("stranded");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        let unique = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // A journal with one open entry and one already-completed one (nothing was ever
+        // in flight under an id no request was given)
+        let stale = ll::RequestId(unique.0 ^ 0x1000);
+        let recovery = bg
+            .notifier()
+            .recover_inflight([unique, stale], Errno::EIO)
+            .unwrap();
+        assert_eq!(recovery, InflightRecovery::ErroredOut(1));
+
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the fallback answers the stranded lookup with EIO");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        release_tx.send(()).unwrap();
+        bg.umount_and_join().unwrap();
         ManuallyDrop::into_inner(tmp);
     }
 
