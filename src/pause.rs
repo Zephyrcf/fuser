@@ -167,6 +167,61 @@ impl SessionPauser {
         self.inner.state.lock().mode == RunMode::Paused
     }
 
+    /// Puts the session into the paused state before any worker exists, so
+    /// workers spawned afterwards park at the top of their first loop
+    /// iteration, before ever reading from the fuse fd. The counterpart of
+    /// [`pause`](SessionPauser::pause) for a session born paused; see
+    /// [`crate::Session::spawn_paused`].
+    pub(crate) fn start_paused(&self) {
+        self.inner.state.lock().mode = RunMode::Paused;
+    }
+
+    /// Waits until exactly `expected` workers are registered and every one
+    /// of them is parked. For a session started paused, where
+    /// [`pause`](SessionPauser::pause) cannot be used: the workers do not
+    /// exist yet when the mode is set, so this is the half of it that waits.
+    ///
+    /// # Errors
+    /// Returns an error if a worker exits instead of parking, if the session
+    /// leaves the paused state, or on timeout. The mode is left untouched:
+    /// the caller decides between resuming and exiting.
+    pub(crate) fn wait_parked(&self, expected: usize, timeout: Duration) -> io::Result<()> {
+        if expected == 0 {
+            return Err(io::Error::other("the session would have no workers"));
+        }
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.state.lock();
+        loop {
+            if state.mode != RunMode::Paused {
+                return Err(io::Error::other("the session is no longer paused"));
+            }
+            // Workers register in one batch, so any other nonzero count means
+            // one of them exited rather than parking
+            if state.workers != 0 && state.workers != expected {
+                return Err(io::Error::other("a session worker exited while parking"));
+            }
+            if state.workers == expected && state.parked == expected {
+                return Ok(());
+            }
+            if self
+                .inner
+                .condvar
+                .wait_until(&mut state, deadline)
+                .timed_out()
+            {
+                if state.mode == RunMode::Paused
+                    && state.workers == expected
+                    && state.parked == expected
+                {
+                    return Ok(());
+                }
+                return Err(io::Error::other(
+                    "timed out waiting for the session workers to park",
+                ));
+            }
+        }
+    }
+
     /// Registers `count` worker loops before they are spawned, so a pause
     /// issued right after spawn already knows how many workers to wait for.
     pub(crate) fn register_workers(&self, count: usize) {
@@ -314,6 +369,46 @@ mod tests {
         let pauser = SessionPauser::new().unwrap();
         assert!(pauser.pause(Duration::from_millis(100)).is_err());
         assert!(!pauser.is_paused());
+    }
+
+    /// A session started paused parks its workers on their first iteration:
+    /// none of them runs the loop body even once until the resume.
+    #[test]
+    fn start_paused_parks_workers_before_their_first_iteration() {
+        let pauser = SessionPauser::new().unwrap();
+        pauser.start_paused();
+        let (iterations, threads) = spawn_workers(&pauser, 3);
+        pauser.wait_parked(3, Duration::from_secs(5)).unwrap();
+        assert!(pauser.is_paused());
+        assert_eq!(iterations.load(Ordering::SeqCst), 0);
+
+        pauser.resume();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while iterations.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "workers never started");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        pauser.exit();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+
+    /// A worker that exits instead of parking fails the wait rather than
+    /// letting it time out, and a count that can never be reached does too.
+    #[test]
+    fn wait_parked_notices_a_missing_worker() {
+        let pauser = SessionPauser::new().unwrap();
+        pauser.start_paused();
+        assert!(pauser.wait_parked(0, Duration::from_millis(100)).is_err());
+        // One worker registered but never parking: only the timeout says so
+        pauser.register_workers(1);
+        assert!(pauser.wait_parked(1, Duration::from_millis(100)).is_err());
+        // A worker exiting is noticed immediately, not by timeout
+        pauser.register_workers(1);
+        drop(pauser.worker_exit_guard());
+        assert!(pauser.wait_parked(2, Duration::from_secs(60)).is_err());
     }
 
     #[test]

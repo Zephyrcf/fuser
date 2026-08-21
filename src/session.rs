@@ -267,6 +267,10 @@ impl<FS: Filesystem> Session<FS> {
     /// If the predecessor died rather than pausing, requests it had read
     /// but not answered are stranded; [`crate::Notifier::resend`] asks the
     /// kernel to deliver them again.
+    ///
+    /// Spawning with [`Session::spawn_paused`] keeps the adoption reversible
+    /// until the successor has confirmed its workers stand ready, which is
+    /// what lets the predecessor resume if standing them up fails.
     pub fn from_initialized_fd(
         filesystem: FS,
         fd: OwnedFd,
@@ -369,6 +373,66 @@ impl<FS: Filesystem> Session<FS> {
             kernel_abi,
             pauser,
         })
+    }
+
+    /// Like [`spawn`](Session::spawn), but every worker loop starts parked,
+    /// before it has read anything from the fuse fd, and this returns only
+    /// once all of them are. What comes back is exactly what a completed
+    /// [`SessionPauser::pause`] leaves behind: on its pauser,
+    /// [`resume`](SessionPauser::resume) starts serving - a condvar
+    /// broadcast, nothing that can fail - and [`exit`](SessionPauser::exit)
+    /// followed by [`join`](BackgroundSession::join) stands down with
+    /// nothing consumed.
+    ///
+    /// This is the successor's half of a two-phase handoff. Adopting a
+    /// connection with [`Session::from_initialized_fd`] and spawning is
+    /// irreversible the moment a worker reads a request: from then on the
+    /// predecessor must not resume, whatever else fails. Starting parked
+    /// makes standing up everything fallible - the fd clones, the worker
+    /// threads - into a separate first phase that touches no request, so the
+    /// successor can confirm readiness while the predecessor still holds the
+    /// pause and can still resume; only then is the handoff committed:
+    ///
+    /// ```no_run
+    /// # fn example(session: fuser::Session<impl fuser::Filesystem + Send + 'static>)
+    /// # -> std::io::Result<()> {
+    /// let bg = session.spawn_paused(std::time::Duration::from_secs(10))?;
+    /// // tell the predecessor everything stands ready, await its decision
+    /// # let committed = true;
+    /// if committed {
+    ///     bg.pauser().resume();
+    /// } else {
+    ///     bg.pauser().exit();
+    ///     bg.join()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// While undecided, the workers are parked and only a resume or an exit
+    /// releases them: end the session through one of the two rather than
+    /// dropping the handle, which would try to join a session that cannot
+    /// finish.
+    ///
+    /// # Errors
+    /// Returns an error if anything failed to stand up - no request was read
+    /// in that case, and the session has been ended and cleaned up, so the
+    /// predecessor is free to resume.
+    pub fn spawn_paused(self, timeout: std::time::Duration) -> io::Result<BackgroundSession> {
+        let expected = self.config.n_threads.unwrap_or(1);
+        let pauser = self.pause.clone();
+        pauser.start_paused();
+        let bg = self.spawn()?;
+        if let Err(err) = pauser.wait_parked(expected, timeout) {
+            // Nothing was read, so ending the workers loses nothing. The
+            // session error says what actually failed, e.g. an fd clone
+            pauser.exit();
+            return Err(match bg.join() {
+                Err(run_err) => run_err,
+                Ok(()) => err,
+            });
+        }
+        Ok(bg)
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -1289,6 +1353,103 @@ mod test {
 
         release_tx.send(()).unwrap();
         bg.umount_and_join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// A session spawned paused stands everything up - fd clones, worker
+    /// threads - without reading a single request: a caller blocks until the
+    /// resume, and the filesystem sees nothing. That is what lets a successor
+    /// confirm readiness before the handoff is committed.
+    #[test]
+    fn spawn_paused_reads_nothing_until_resumed() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+
+        struct Counting {
+            lookups: Arc<AtomicUsize>,
+        }
+        impl Filesystem for Counting {
+            fn lookup(
+                &self,
+                _req: &Request,
+                _parent: INodeNo,
+                _name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                reply.error(Errno::ENOENT);
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let session = Session::new(
+            Counting {
+                lookups: lookups.clone(),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+
+        let bg = session.spawn_paused(Duration::from_secs(10)).unwrap();
+        assert!(bg.pauser().is_paused());
+
+        let client_path = mountpoint.join("waiting");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "a parked worker must not have read the request"
+        );
+        assert!(!client.is_finished(), "the caller must still be blocked");
+
+        bg.pauser().resume();
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the resumed session answers the lookup with ENOENT");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(lookups.load(Ordering::SeqCst) > 0);
+
+        bg.umount_and_join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// Backing out of a session spawned paused ends it as if nothing was
+    /// spawned: exit and join return cleanly and the mount is gone with
+    /// them, without a request having been read.
+    #[test]
+    fn spawn_paused_abort_stands_down_cleanly() {
+        use std::time::Duration;
+
+        struct Refusing;
+        impl Filesystem for Refusing {}
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let session = Session::new(Refusing, &mountpoint, &Config::default()).unwrap();
+        let bg = session.spawn_paused(Duration::from_secs(10)).unwrap();
+        bg.pauser().exit();
+        bg.join().unwrap();
+
+        // The mount teardown has run: the mountpoint is a plain directory again
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        assert!(
+            !mounts
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == mountpoint.to_str()),
+            "nothing must remain mounted after an abort"
+        );
         ManuallyDrop::into_inner(tmp);
     }
 
