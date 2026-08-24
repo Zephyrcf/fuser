@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::io;
 use std::mem;
@@ -15,7 +16,7 @@ use std::sync::atomic::Ordering;
 use crate::RequestId;
 
 const JOURNAL_MAGIC: [u8; 8] = *b"FUSRIFL\0";
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const DEFAULT_CAPACITY: usize = 65_536;
 const MAX_CAPACITY: usize = 1_048_576;
 
@@ -34,9 +35,13 @@ struct JournalHeader {
 #[repr(C)]
 struct JournalSlot {
     state: AtomicU32,
-    unique_low: AtomicU32,
-    unique_high: AtomicU32,
+    unique: UnsafeCell<[u8; mem::size_of::<u64>()]>,
 }
+
+// SLOT_RESERVED grants one worker exclusive access to `unique`; SLOT_INFLIGHT
+// publishes those bytes with release/acquire ordering. Recovery reads a
+// reserved slot only after the predecessor process has exited.
+unsafe impl Sync for JournalSlot {}
 
 struct JournalInner {
     fd: OwnedFd,
@@ -123,8 +128,7 @@ impl InflightJournal {
             for index in 0..capacity {
                 slots.add(index).write(JournalSlot {
                     state: AtomicU32::new(SLOT_EMPTY),
-                    unique_low: AtomicU32::new(0),
-                    unique_high: AtomicU32::new(0),
+                    unique: UnsafeCell::new([0; mem::size_of::<u64>()]),
                 });
             }
         }
@@ -229,6 +233,38 @@ impl InflightJournal {
         Ok(pending)
     }
 
+    /// Returns requests recoverable after the journal's writer process has exited.
+    ///
+    /// A worker reserves a slot before entering `read(2)`. The request unique
+    /// field is the shared target of that read, so a predecessor that dies
+    /// after consuming a request but before publishing the slot still leaves
+    /// its ID here. A zero unique means the read never consumed a request and
+    /// the abandoned reservation can be cleared.
+    pub(crate) fn recoverable_requests(&self) -> io::Result<Vec<RequestId>> {
+        let mut pending = Vec::new();
+        for slot in self.slots() {
+            match slot.state.load(Ordering::Acquire) {
+                SLOT_EMPTY => {}
+                SLOT_RESERVED => {
+                    let unique = slot_request_id(slot);
+                    if unique.0 == 0 {
+                        slot.state.store(SLOT_EMPTY, Ordering::Release);
+                    } else {
+                        pending.push(unique);
+                    }
+                }
+                SLOT_INFLIGHT => pending.push(slot_request_id(slot)),
+                state => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid inflight journal slot state {state}"),
+                    ));
+                }
+            }
+        }
+        Ok(pending)
+    }
+
     fn slots(&self) -> &[JournalSlot] {
         unsafe {
             std::slice::from_raw_parts(
@@ -257,6 +293,9 @@ impl InflightJournal {
                 )
                 .is_ok()
             {
+                unsafe {
+                    *slot.unique.get() = [0; mem::size_of::<u64>()];
+                }
                 return Ok(InflightReservation {
                     journal: self.clone(),
                     index,
@@ -289,11 +328,20 @@ pub(crate) struct InflightReservation {
 }
 
 impl InflightReservation {
+    pub(crate) fn unique_buffer(&mut self) -> &mut [u8] {
+        unsafe { &mut *self.journal.slot(self.index).unique.get() }
+    }
+
+    pub(crate) fn copy_unique_to(&self, destination: &mut [u8]) {
+        debug_assert_eq!(destination.len(), mem::size_of::<u64>());
+        destination.copy_from_slice(unsafe { &*self.journal.slot(self.index).unique.get() });
+    }
+
     pub(crate) fn publish(mut self, unique: RequestId) -> InflightRequest {
         let slot = self.journal.slot(self.index);
-        slot.unique_low.store(unique.0 as u32, Ordering::Relaxed);
-        slot.unique_high
-            .store((unique.0 >> 32) as u32, Ordering::Relaxed);
+        unsafe {
+            *slot.unique.get() = unique.0.to_ne_bytes();
+        }
         slot.state.store(SLOT_INFLIGHT, Ordering::Release);
         self.reserved = false;
         InflightRequest {
@@ -341,9 +389,8 @@ impl InflightRequest {
 }
 
 fn slot_request_id(slot: &JournalSlot) -> RequestId {
-    let low = slot.unique_low.load(Ordering::Relaxed) as u64;
-    let high = slot.unique_high.load(Ordering::Relaxed) as u64;
-    RequestId(low | (high << 32))
+    let bytes = unsafe { std::ptr::read_volatile(slot.unique.get()) };
+    RequestId(u64::from_ne_bytes(bytes))
 }
 
 fn mapping_len(capacity: usize) -> io::Result<usize> {
@@ -421,4 +468,38 @@ fn validate_seals(fd: &OwnedFd) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_clears_a_reservation_that_consumed_no_request() {
+        let journal = InflightJournal::create_with_capacity(1).unwrap();
+        let reservation = journal.reserve().unwrap();
+        mem::forget(reservation);
+
+        assert_eq!(journal.recoverable_requests().unwrap(), []);
+        assert_eq!(journal.pending_requests().unwrap(), []);
+    }
+
+    #[test]
+    fn recovery_keeps_the_unique_written_into_an_unpublished_reservation() {
+        let journal = InflightJournal::create_with_capacity(1).unwrap();
+        let mut reservation = journal.reserve().unwrap();
+        reservation
+            .unique_buffer()
+            .copy_from_slice(&0x1234_5678_9abc_def0u64.to_ne_bytes());
+        mem::forget(reservation);
+
+        assert_eq!(
+            journal.pending_requests().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            journal.recoverable_requests().unwrap(),
+            [RequestId(0x1234_5678_9abc_def0)]
+        );
+    }
 }

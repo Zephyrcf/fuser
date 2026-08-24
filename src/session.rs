@@ -835,7 +835,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             #[cfg(target_os = "linux")]
-            let reservation = match &self.inflight_journal {
+            let mut reservation = match &self.inflight_journal {
                 Some(journal) => match journal.reserve() {
                     Ok(reservation) => Some(reservation),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -846,7 +846,11 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 },
                 None => None,
             };
-            match self.ch.receive(buf) {
+            let received = match reservation.as_mut() {
+                Some(reservation) => self.ch.receive_journaled(buf, reservation),
+                None => self.ch.receive(buf),
+            };
+            match received {
                 Ok(size) => {
                     match RequestWithSender::new(
                         self.ch.sender(),
