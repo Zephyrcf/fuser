@@ -32,6 +32,8 @@ use serde::Serialize;
 pub use crate::access_flags::AccessFlags;
 pub use crate::bsd_file_flags::BsdFileFlags;
 use crate::forget_one::ForgetOne;
+#[cfg(target_os = "linux")]
+pub use crate::inflight::InflightJournal;
 pub use crate::ll::Errno;
 pub use crate::ll::Generation;
 pub use crate::ll::RequestId;
@@ -95,6 +97,8 @@ mod dev_fuse;
 #[cfg(feature = "experimental")]
 pub mod experimental;
 mod forget_one;
+#[cfg(target_os = "linux")]
+mod inflight;
 mod ll;
 mod mnt;
 mod notify;

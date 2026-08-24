@@ -23,6 +23,8 @@ use crate::FileType;
 use crate::PollEvents;
 use crate::StatxAttr;
 use crate::channel::ChannelSender;
+#[cfg(target_os = "linux")]
+use crate::inflight::InflightRequest;
 use crate::ll::Generation;
 use crate::ll::INodeNo;
 use crate::ll::flags::fopen_flags::FopenFlags;
@@ -39,6 +41,8 @@ use crate::passthrough::BackingId;
 #[derive(Debug)]
 pub(crate) enum ReplySender {
     Channel(ChannelSender),
+    #[cfg(target_os = "linux")]
+    Tracked(ChannelSender, InflightRequest),
     #[cfg(test)]
     Assert(AssertSender),
     #[cfg(test)]
@@ -46,10 +50,30 @@ pub(crate) enum ReplySender {
 }
 
 impl ReplySender {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tracked(sender: ChannelSender, inflight: Option<InflightRequest>) -> ReplySender {
+        match inflight {
+            Some(inflight) => ReplySender::Tracked(sender, inflight),
+            None => ReplySender::Channel(sender),
+        }
+    }
+
     /// Send data.
     pub(crate) fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
         match self {
             ReplySender::Channel(sender) => sender.send(data),
+            #[cfg(target_os = "linux")]
+            ReplySender::Tracked(sender, inflight) => {
+                let result = sender.send(data);
+                if result.is_ok()
+                    || result
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    inflight.complete();
+                }
+                result
+            }
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
             #[cfg(test)]
@@ -64,6 +88,8 @@ impl ReplySender {
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
             ReplySender::Channel(sender) => sender.open_backing(fd),
+            #[cfg(target_os = "linux")]
+            ReplySender::Tracked(sender, _) => sender.open_backing(fd),
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -75,6 +101,8 @@ impl ReplySender {
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         match self {
             ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
+            #[cfg(target_os = "linux")]
+            ReplySender::Tracked(sender, _) => unsafe { sender.wrap_backing(id) },
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]

@@ -37,6 +37,8 @@ use crate::Request;
 use crate::channel::Channel;
 use crate::channel::ChannelSender;
 use crate::dev_fuse::DevFuse;
+#[cfg(target_os = "linux")]
+use crate::inflight::InflightJournal;
 use crate::ll;
 use crate::ll::Operation;
 use crate::ll::ResponseErrno;
@@ -160,6 +162,8 @@ pub struct Session<FS: Filesystem> {
     /// Pause/resume control shared with the worker loops, for handing the
     /// session's fd off to a successor process during a hot upgrade.
     pub(crate) pause: SessionPauser,
+    #[cfg(target_os = "linux")]
+    inflight_journal: Option<InflightJournal>,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -210,6 +214,8 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities: InitFlags::empty(),
             config: options.clone(),
             pause: SessionPauser::new()?,
+            #[cfg(target_os = "linux")]
+            inflight_journal: None,
         };
 
         session.handshake()?;
@@ -241,6 +247,8 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities: InitFlags::empty(),
             config,
             pause: SessionPauser::new()?,
+            #[cfg(target_os = "linux")]
+            inflight_journal: None,
         };
 
         session.handshake()?;
@@ -296,6 +304,8 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities,
             config,
             pause: SessionPauser::new()?,
+            #[cfg(target_os = "linux")]
+            inflight_journal: None,
         })
     }
 
@@ -325,6 +335,21 @@ impl<FS: Filesystem> Session<FS> {
     /// a hot upgrade.
     pub fn pauser(&self) -> SessionPauser {
         self.pause.clone()
+    }
+
+    /// Enables process-shared tracking of requests read but not yet answered.
+    ///
+    /// Set the same journal on a successor before spawning its workers. A failover holder can
+    /// retain the journal descriptor alongside the live FUSE descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn set_inflight_journal(&mut self, journal: InflightJournal) {
+        self.inflight_journal = Some(journal);
+    }
+
+    /// Returns the process-shared journal attached to this session, if any.
+    #[cfg(target_os = "linux")]
+    pub fn inflight_journal(&self) -> Option<&InflightJournal> {
+        self.inflight_journal.as_ref()
     }
 
     /// Complete an outstanding request with an error, identified by its id alone.
@@ -359,6 +384,8 @@ impl<FS: Filesystem> Session<FS> {
         let kernel_capabilities = self.kernel_capabilities;
         let kernel_abi = self.proto_version;
         let pauser = self.pause.clone();
+        #[cfg(target_os = "linux")]
+        let inflight_journal = self.inflight_journal.clone();
         // Take the fuse_session, so that we can unmount it
         let mount = Arc::new(Mutex::new(std::mem::take(&mut *self.mount.mount.lock())));
         let guard = thread::Builder::new()
@@ -372,6 +399,8 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities,
             kernel_abi,
             pauser,
+            #[cfg(target_os = "linux")]
+            inflight_journal,
         })
     }
 
@@ -453,6 +482,8 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities,
             config,
             pause,
+            #[cfg(target_os = "linux")]
+            inflight_journal,
         } = self;
 
         let n_threads = config.n_threads.unwrap_or(1);
@@ -507,6 +538,8 @@ impl<FS: Filesystem> Session<FS> {
                 kernel_capabilities,
                 kernel_abi: proto_version,
                 pause: pause.clone(),
+                #[cfg(target_os = "linux")]
+                inflight_journal: inflight_journal.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -747,6 +780,8 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     /// Pause/resume control shared across the session's workers, for handing
     /// the session's fd off to a successor process during a hot upgrade.
     pub(crate) pause: SessionPauser,
+    #[cfg(target_os = "linux")]
+    pub(crate) inflight_journal: Option<InflightJournal>,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
@@ -799,9 +834,27 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
+            #[cfg(target_os = "linux")]
+            let reservation = match &self.inflight_journal {
+                Some(journal) => match journal.reserve() {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::yield_now();
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
             match self.ch.receive(buf) {
                 Ok(size) => {
-                    match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
+                    match RequestWithSender::new(
+                        self.ch.sender(),
+                        &buf[..size],
+                        self.negotiated,
+                        #[cfg(target_os = "linux")]
+                        reservation,
+                    ) {
                         // Dispatch request
                         Some(req) => {
                             if let Ok(Operation::Destroy(_)) = req.request.operation() {
@@ -868,6 +921,8 @@ pub struct BackgroundSession {
     /// Pause/resume control over the worker loops, for handing the session's
     /// fd off to a successor process during a hot upgrade.
     pauser: SessionPauser,
+    #[cfg(target_os = "linux")]
+    inflight_journal: Option<InflightJournal>,
 }
 
 /// How long teardown waits for the kernel connection to end after a successful
@@ -923,6 +978,12 @@ impl BackgroundSession {
     /// a hot upgrade.
     pub fn pauser(&self) -> SessionPauser {
         self.pauser.clone()
+    }
+
+    /// Returns the process-shared journal attached to this session, if any.
+    #[cfg(target_os = "linux")]
+    pub fn inflight_journal(&self) -> Option<&InflightJournal> {
+        self.inflight_journal.as_ref()
     }
 
     /// A handle that can permanently disarm the mount teardown: after
@@ -1526,7 +1587,7 @@ mod test {
 
         let (read_tx, read_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let session = Session::new(
+        let mut session = Session::new(
             Journaling {
                 read: read_tx,
                 release: Mutex::new(release_rx),
@@ -1547,18 +1608,17 @@ mod test {
             ManuallyDrop::into_inner(tmp);
             return;
         }
+        let journal = InflightJournal::create().unwrap();
+        session.set_inflight_journal(journal);
         let bg = session.spawn().unwrap();
 
         let client_path = mountpoint.join("stranded");
         let client = thread::spawn(move || std::fs::metadata(client_path));
-        let unique = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
-        // A journal with one open entry and one already-completed one (nothing was ever
-        // in flight under an id no request was given)
-        let stale = ll::RequestId(unique.0 ^ 0x1000);
         let recovery = bg
             .notifier()
-            .recover_inflight([unique, stale], Errno::EIO)
+            .recover_inflight(bg.inflight_journal().unwrap(), Errno::EIO)
             .unwrap();
         assert_eq!(recovery, InflightRecovery::ErroredOut(1));
 
