@@ -248,7 +248,7 @@ impl Notifier {
             Err(e) => return Err(e),
         }
         let mut open = 0;
-        for unique in journal.pending_requests()? {
+        for unique in journal.recoverable_requests()? {
             let sent = ResponseErrno(error).with_iovec(unique, |iov| self.sender.send(iov));
             match sent {
                 Ok(()) => open += 1,

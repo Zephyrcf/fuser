@@ -1,4 +1,5 @@
 use std::io;
+use std::io::IoSliceMut;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -6,6 +7,8 @@ use std::sync::Arc;
 use nix::errno::Errno;
 
 use crate::dev_fuse::DevFuse;
+#[cfg(target_os = "linux")]
+use crate::inflight::InflightReservation;
 use crate::passthrough::BackingId;
 
 /// A raw communication channel to the FUSE kernel driver
@@ -29,6 +32,34 @@ impl Channel {
     /// Receives data up to the capacity of the given buffer (can block).
     pub(crate) fn receive(&self, buffer: &mut [u8]) -> nix::Result<usize> {
         nix::unistd::read(&self.0, buffer)
+    }
+
+    /// Receives one request while placing its unique ID directly in a
+    /// process-shared journal reservation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn receive_journaled(
+        &self,
+        buffer: &mut [u8],
+        reservation: &mut InflightReservation,
+    ) -> nix::Result<usize> {
+        const UNIQUE_OFFSET: usize = 8;
+        const UNIQUE_BYTES: usize = std::mem::size_of::<u64>();
+        const AFTER_UNIQUE: usize = UNIQUE_OFFSET + UNIQUE_BYTES;
+        if buffer.len() < AFTER_UNIQUE {
+            return Err(nix::errno::Errno::EINVAL);
+        }
+
+        let (prefix, remainder) = buffer.split_at_mut(UNIQUE_OFFSET);
+        let (_, suffix) = remainder.split_at_mut(UNIQUE_BYTES);
+        let mut slices = [
+            IoSliceMut::new(prefix),
+            IoSliceMut::new(reservation.unique_buffer()),
+            IoSliceMut::new(suffix),
+        ];
+        let size = nix::sys::uio::readv(&self.0, &mut slices)?;
+        drop(slices);
+        reservation.copy_unique_to(&mut buffer[UNIQUE_OFFSET..AFTER_UNIQUE]);
+        Ok(size)
     }
 
     /// Receives data up to the capacity of the given buffer (can block),
@@ -103,5 +134,45 @@ impl ChannelSender {
 
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         unsafe { BackingId::wrap_raw(&self.0, id) }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+    use crate::inflight::InflightJournal;
+    use crate::ll::RequestId;
+
+    #[test]
+    fn journaled_receive_writes_the_request_unique_to_shared_memory() {
+        let (mut kernel, daemon) = UnixStream::pair().unwrap();
+        let channel = Channel::new(Arc::new(DevFuse(File::from(OwnedFd::from(daemon)))));
+        let journal = InflightJournal::create().unwrap();
+        let mut reservation = journal.reserve().unwrap();
+        let mut request = [0u8; 40];
+        let request_len = request.len();
+        request[..4].copy_from_slice(&(request_len as u32).to_ne_bytes());
+        request[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        request[8..16].copy_from_slice(&0x1234_5678_9abc_def0u64.to_ne_bytes());
+        kernel.write_all(&request).unwrap();
+
+        let mut received = [0u8; 40];
+        assert_eq!(
+            channel
+                .receive_journaled(&mut received, &mut reservation)
+                .unwrap(),
+            request_len
+        );
+        assert_eq!(received, request);
+        std::mem::forget(reservation);
+        assert_eq!(
+            journal.recoverable_requests().unwrap(),
+            [RequestId(0x1234_5678_9abc_def0)]
+        );
     }
 }
