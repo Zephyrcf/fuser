@@ -7,8 +7,9 @@ use std::io;
 use crate::INodeNo;
 use crate::Version;
 use crate::channel::ChannelSender;
+#[cfg(target_os = "linux")]
+use crate::inflight::InflightJournal;
 use crate::ll::Errno;
-use crate::ll::RequestId;
 use crate::ll::ResponseErrno;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi::FUSE_EXPIRE_ONLY;
@@ -223,27 +224,31 @@ impl Notifier {
     /// cannot, as [`Session::reply_error`](crate::Session::reply_error) does. The
     /// returned [`InflightRecovery`] says which of the two happened.
     ///
-    /// `journaled` is every request id the predecessor read and had not answered, as
-    /// recorded by a journal it kept; ids it answered after all are ignored. A kernel
-    /// that resends does not consult the journal, so a filesystem may pass an empty one
-    /// where it keeps none - but then there is no fallback, and callers on an older
-    /// kernel stay blocked.
+    /// `journal` must be the process-shared journal attached to the predecessor session.
+    /// Workers must remain parked until this method returns. Recovery clears the journal
+    /// only after every error reply is accepted, or after a successful resend; a partial
+    /// failure leaves it intact so retrying is safe.
     ///
     /// # Errors
     /// Returns an error if the kernel rejects the resend notification for any reason
     /// other than not supporting it, or rejects one of the replies for any reason other
     /// than the request already being complete.
-    pub fn recover_inflight<I>(&self, journaled: I, error: Errno) -> io::Result<InflightRecovery>
-    where
-        I: IntoIterator<Item = RequestId>,
-    {
+    #[cfg(target_os = "linux")]
+    pub fn recover_inflight(
+        &self,
+        journal: &InflightJournal,
+        error: Errno,
+    ) -> io::Result<InflightRecovery> {
         match self.resend() {
-            Ok(()) => return Ok(InflightRecovery::Resent),
+            Ok(()) => {
+                journal.clear();
+                return Ok(InflightRecovery::Resent);
+            }
             Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
             Err(e) => return Err(e),
         }
         let mut open = 0;
-        for unique in journaled {
+        for unique in journal.pending_requests()? {
             let sent = ResponseErrno(error).with_iovec(unique, |iov| self.sender.send(iov));
             match sent {
                 Ok(()) => open += 1,
@@ -253,6 +258,7 @@ impl Notifier {
                 Err(e) => return Err(e),
             }
         }
+        journal.clear();
         Ok(InflightRecovery::ErroredOut(open))
     }
 
@@ -382,9 +388,11 @@ mod test {
 
     /// A kernel that resends handles everything itself: the journal is not consulted.
     #[test]
+    #[cfg(target_os = "linux")]
     fn recover_inflight_resends_where_the_kernel_can() {
+        let journal = InflightJournal::create().unwrap();
         let recovery = notifier(InitFlags::FUSE_HAS_RESEND)
-            .recover_inflight([crate::ll::RequestId(42)], crate::Errno::EIO)
+            .recover_inflight(&journal, crate::Errno::EIO)
             .unwrap();
         assert_eq!(recovery, InflightRecovery::Resent);
     }
@@ -392,9 +400,11 @@ mod test {
     /// Without resend the journal is what there is; nothing journaled means nothing
     /// to answer, and the count says so.
     #[test]
+    #[cfg(target_os = "linux")]
     fn recover_inflight_falls_back_to_the_journal() {
+        let journal = InflightJournal::create().unwrap();
         let recovery = notifier(InitFlags::empty())
-            .recover_inflight([], crate::Errno::EIO)
+            .recover_inflight(&journal, crate::Errno::EIO)
             .unwrap();
         assert_eq!(recovery, InflightRecovery::ErroredOut(0));
     }
