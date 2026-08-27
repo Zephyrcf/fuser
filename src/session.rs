@@ -967,6 +967,22 @@ impl BackgroundSession {
         self.join_impl()
     }
 
+    /// Non-blocking probe for whether the session thread has terminated.
+    ///
+    /// The workers can exit with an error (a malformed request, a poll or
+    /// read failure) while the kernel connection stays alive — the held
+    /// [`Mount`] and any cloned FUSE device fd keep it up, so polling the
+    /// fd never reports it as dead. A controller that polls the connection
+    /// to decide when to tear down would livelock in that case; this mirrors
+    /// [`JoinHandle::is_finished`] so a liveness check can also cover worker
+    /// completion. Returns `false` once the session has been joined.
+    ///
+    /// [`Mount`]: crate::mnt::Mount
+    /// [`JoinHandle::is_finished`]: std::thread::JoinHandle::is_finished
+    pub fn is_finished(&self) -> bool {
+        self.guard.as_ref().is_some_and(|h| h.is_finished())
+    }
+
     /// Complete an outstanding request with an error, identified by its id alone.
     /// See [`Session::reply_error`].
     ///
