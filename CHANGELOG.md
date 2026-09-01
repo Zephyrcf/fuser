@@ -20,8 +20,9 @@
   version and init flags the predecessor reports via `Session::proto_version()`,
   `Session::negotiated_init_flags()` and `Session::kernel_init_flags()`. After a successful
   handoff the predecessor calls `BackgroundSession::mount_disarmer()` and disarms its automatic
-  unmount, which now belongs to nobody: the successor's caller unmounts by path when it
-  retires the mountpoint. Mounts using `MountOption::AutoUnmount` cannot be handed off.
+  unmount; the successor later calls `unmount_path()` to retire the inherited mount with the
+  same direct-or-fusermount fallback as a fresh session. Mounts using
+  `MountOption::AutoUnmount` cannot be handed off.
   `Session::spawn_paused()` makes the handoff two-phase: the successor's workers start
   parked, before reading a single request, so everything fallible has already happened by
   the time it returns - committing is `SessionPauser::resume()`, which cannot fail, and

@@ -53,6 +53,8 @@ pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
 pub use crate::mnt::mount_options::Config;
 pub use crate::mnt::mount_options::MountOption;
+#[cfg(target_os = "linux")]
+pub use crate::mnt::unmount_path;
 pub use crate::notify::InflightRecovery;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;

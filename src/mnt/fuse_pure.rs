@@ -3,7 +3,7 @@
 //! This is a small set of bindings that are required to mount/unmount FUSE filesystems and
 //! open/close a fd to the FUSE kernel driver.
 
-use std::env;
+#[cfg(not(target_os = "linux"))]
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -45,11 +45,9 @@ use crate::mnt::mount_options::option_group;
 use crate::mnt::mount_options::option_to_escaped_string;
 use crate::mnt::mount_options::option_to_flag;
 use crate::mnt::mount_options::option_to_string;
+use crate::mnt::{MOUNT_FUSEFS_BIN, detect_fusermount_bin};
 
-const FUSERMOUNT_BIN: &str = "fusermount";
-const FUSERMOUNT3_BIN: &str = "fusermount3";
 const FUSERMOUNT_COMM_ENV: &str = "_FUSE_COMMFD";
-const MOUNT_FUSEFS_BIN: &str = "mount_fusefs";
 
 #[derive(Debug)]
 pub(crate) struct MountImpl {
@@ -87,6 +85,11 @@ impl MountImpl {
     }
 
     fn umount_now(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            return crate::mnt::unmount_path_cstr(&self.mountpoint);
+        }
+        #[cfg(not(target_os = "linux"))]
         if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
             if err == nix::errno::Errno::EPERM {
                 // Linux always returns EPERM for non-root users.  We have to let the
@@ -129,6 +132,7 @@ fn fuse_mount_pure(
 
 /// Only reached once `libc_umount()` has failed with EPERM, i.e. unprivileged, so
 /// there is no point in retrying the same unmount syscall with different flags
+#[cfg(not(target_os = "linux"))]
 fn fuse_unmount_pure(mountpoint: &CStr) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -137,39 +141,6 @@ fn fuse_unmount_pure(mountpoint: &CStr) -> io::Result<()> {
         }
     }
     crate::mnt::fusermount_unmount(&detect_fusermount_bin()?, mountpoint)
-}
-
-fn detect_fusermount_bin() -> io::Result<String> {
-    if let Some(fusermount) = env::var_os("FUSERMOUNT_PATH") {
-        return Ok(fusermount
-            .to_str()
-            .expect("FUSERMOUNT_PATH is not UTF-8")
-            .to_owned());
-    }
-
-    let candidates = [
-        FUSERMOUNT3_BIN.to_string(),
-        FUSERMOUNT_BIN.to_string(),
-        MOUNT_FUSEFS_BIN.to_string(),
-        format!("/sbin/{FUSERMOUNT3_BIN}"),
-        format!("/sbin/{FUSERMOUNT_BIN}"),
-        format!("/sbin/{MOUNT_FUSEFS_BIN}"),
-        format!("/bin/{FUSERMOUNT3_BIN}"),
-        format!("/bin/{FUSERMOUNT_BIN}"),
-    ];
-    for name in candidates.iter() {
-        if Command::new(name).arg("-h").output().is_ok() {
-            return Ok(name.to_string());
-        }
-    }
-    // None of these could be started, so naming a single guessed default would be misleading
-    Err(Error::new(
-        ErrorKind::NotFound,
-        format!(
-            "no FUSE mount helper found, tried {} (set FUSERMOUNT_PATH to override)",
-            candidates.join(", ")
-        ),
-    ))
 }
 
 fn receive_fusermount_message(socket: &UnixStream) -> Result<DevFuse, Error> {
