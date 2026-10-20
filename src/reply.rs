@@ -23,6 +23,7 @@ use crate::FileType;
 use crate::PollEvents;
 use crate::StatxAttr;
 use crate::channel::ChannelSender;
+use crate::inflight::InflightRequest;
 use crate::ll::Generation;
 use crate::ll::INodeNo;
 use crate::ll::flags::fopen_flags::FopenFlags;
@@ -38,7 +39,9 @@ use crate::passthrough::BackingId;
 /// Generic reply callback to send data
 #[derive(Debug)]
 pub(crate) enum ReplySender {
-    Channel(ChannelSender),
+    /// Replies to the kernel, striking the request from the inflight journal,
+    /// if it is tracked there, once the kernel took the reply.
+    Channel(ChannelSender, Option<InflightRequest>),
     #[cfg(test)]
     Assert(AssertSender),
     #[cfg(test)]
@@ -49,7 +52,20 @@ impl ReplySender {
     /// Send data.
     pub(crate) fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
         match self {
-            ReplySender::Channel(sender) => sender.send(data),
+            ReplySender::Channel(sender, inflight) => {
+                let result = sender.send(data);
+                if let Some(inflight) = inflight {
+                    // NotFound: the request was already answered
+                    if result.is_ok()
+                        || result
+                            .as_ref()
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        inflight.complete();
+                    }
+                }
+                result
+            }
             #[cfg(test)]
             ReplySender::Assert(sender) => sender.send(data),
             #[cfg(test)]
@@ -63,7 +79,7 @@ impl ReplySender {
     /// Open a backing file
     pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
         match self {
-            ReplySender::Channel(sender) => sender.open_backing(fd),
+            ReplySender::Channel(sender, _) => sender.open_backing(fd),
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]
@@ -74,7 +90,7 @@ impl ReplySender {
     /// Wraps a raw backing file ID
     pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         match self {
-            ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
+            ReplySender::Channel(sender, _) => unsafe { sender.wrap_backing(id) },
             #[cfg(test)]
             ReplySender::Assert(_) => unreachable!(),
             #[cfg(test)]

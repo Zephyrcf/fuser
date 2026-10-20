@@ -32,6 +32,8 @@ use serde::Serialize;
 pub use crate::access_flags::AccessFlags;
 pub use crate::bsd_file_flags::BsdFileFlags;
 use crate::forget_one::ForgetOne;
+#[cfg(target_os = "linux")]
+pub use crate::inflight::InflightJournal;
 pub use crate::ll::Errno;
 pub use crate::ll::Generation;
 pub use crate::ll::RequestId;
@@ -53,6 +55,8 @@ pub use crate::mnt::mount_options::Config;
 pub use crate::mnt::mount_options::MountOption;
 #[cfg(target_os = "linux")]
 pub use crate::mnt::unmount_path;
+#[cfg(target_os = "linux")]
+pub use crate::notify::InflightRecovery;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
 pub use crate::notify::PollNotifier;
@@ -98,6 +102,11 @@ mod dev_fuse;
 #[cfg(feature = "experimental")]
 pub mod experimental;
 mod forget_one;
+#[cfg(target_os = "linux")]
+mod inflight;
+#[cfg(not(target_os = "linux"))]
+#[path = "inflight_stub.rs"]
+mod inflight;
 mod ll;
 mod mnt;
 mod notify;
@@ -167,9 +176,6 @@ const UNSUPPORTED_CAPABILITIES: InitFlags = ALIASED_UNSUPPORTED_CAPABILITIES
     .union(InitFlags::FUSE_HAS_INODE_DAX)
     // The kernel would route requests to io_uring queues that fuser never creates
     .union(InitFlags::FUSE_OVER_IO_URING)
-    // Announces that the filesystem copes with requests the kernel resends. fuser cannot send
-    // the FUSE_NOTIFY_RESEND notification that asks for a resend in the first place
-    .union(InitFlags::FUSE_HAS_RESEND)
     // The timeout is carried by a request_timeout field of fuse_init_out that fuser declares as
     // reserved and always sends as zero, which the kernel reads as "no timeout requested"
     .union(InitFlags::FUSE_REQUEST_TIMEOUT);

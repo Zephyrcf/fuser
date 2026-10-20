@@ -2,6 +2,7 @@ use ref_cast::RefCastCustom;
 use ref_cast::ref_cast_custom;
 
 use crate::ll;
+use crate::ll::fuse_abi::FUSE_UNIQUE_RESEND;
 use crate::ll::fuse_abi::fuse_in_header;
 
 /// FUSE request parameters.
@@ -50,5 +51,17 @@ impl Request {
     #[inline]
     pub fn pid(&self) -> u32 {
         self.header.pid
+    }
+
+    /// Whether the kernel is delivering this request again, after
+    /// [`Notifier::resend`](crate::Notifier::resend) asked for everything in flight back.
+    ///
+    /// A predecessor process may have already acted on the request before dying, so a
+    /// non-idempotent operation seeing this flag may have run once already. The kernel marks
+    /// redelivery in the high bit of the request id, which therefore differs from the id the
+    /// first delivery carried by exactly that bit.
+    #[inline]
+    pub fn is_resend(&self) -> bool {
+        self.header.unique & FUSE_UNIQUE_RESEND != 0
     }
 }

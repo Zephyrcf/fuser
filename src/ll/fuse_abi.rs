@@ -198,6 +198,11 @@ pub(crate) enum fuse_notify_code {
 /// code and answers the write with `EINVAL`
 pub(crate) const FUSE_NOTIFY_INC_EPOCH_VERSION: Version = Version(7, 44);
 
+/// Set in the request id of a request the kernel delivers again after a
+/// `FUSE_NOTIFY_RESEND` notification. Replies echo the id verbatim, bit included,
+/// which is also what the kernel stored the request under
+pub(crate) const FUSE_UNIQUE_RESEND: u64 = 1 << 63;
+
 /// ABI version that added `FUSE_STATX`. An older kernel never sends the opcode, and answers
 /// `statx(2)` out of what `FUSE_GETATTR` gives it, so nothing outside the tests has to ask -
 /// and only the Linux ones, since `statx(2)` is Linux's

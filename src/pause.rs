@@ -211,6 +211,13 @@ impl SessionPauser {
         self.inner.condvar.notify_all();
     }
 
+    /// Returns whether no worker of this session can be reading or answering
+    /// a request: either none is running, or all of them are parked.
+    pub(crate) fn workers_quiescent(&self) -> bool {
+        let state = self.inner.state.lock();
+        state.workers == 0 || (state.mode == RunMode::Paused && state.parked == state.workers)
+    }
+
     /// Deregistration guard for one worker loop; dropping it (worker exit)
     /// updates the bookkeeping and wakes any pause() waiter.
     pub(crate) fn worker_exit_guard(&self) -> WorkerExitGuard {
@@ -487,5 +494,20 @@ mod tests {
             "timed out waiting for the session workers to park"
         );
         assert_eq!(mode(&pauser), RunMode::Running);
+    }
+
+    #[test]
+    fn workers_are_quiescent_only_when_absent_or_all_parked() {
+        let pauser = SessionPauser::new().unwrap();
+        assert!(pauser.workers_quiescent());
+        let (_iterations, threads) = spawn_workers(&pauser, 2);
+        assert!(!pauser.workers_quiescent());
+        pauser.pause(Duration::from_secs(5)).unwrap();
+        assert!(pauser.workers_quiescent());
+        pauser.exit();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(pauser.workers_quiescent());
     }
 }

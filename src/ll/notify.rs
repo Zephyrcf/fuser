@@ -115,9 +115,9 @@ impl<'a> Notification<'a> {
         Ok(Self::from_struct_with_name(&r, name.as_bytes()))
     }
 
-    /// The notification carries no payload at all: the kernel's handler takes only the
-    /// connection, ignoring the size and the rest of the message
-    pub(crate) fn new_inc_epoch() -> Self {
+    /// A notification without payload, for codes whose kernel handler takes only the
+    /// connection (`FUSE_NOTIFY_INC_EPOCH`, `FUSE_NOTIFY_RESEND`)
+    pub(crate) fn new_bare() -> Self {
         Self::Bare(NotificationBuf::new())
     }
 
@@ -237,11 +237,24 @@ mod test {
     /// read past it.
     #[test]
     fn inc_epoch() {
-        let n = Notification::new_inc_epoch()
+        let n = Notification::new_bare()
             .with_iovec(abi::fuse_notify_code::FUSE_NOTIFY_INC_EPOCH, ioslice_to_vec)
             .unwrap();
         let expected = vec![
             0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(n, expected);
+    }
+
+    /// Like `inc_epoch`, nothing but a header, this one carrying code 7.
+    #[test]
+    fn resend() {
+        let n = Notification::new_bare()
+            .with_iovec(abi::fuse_notify_code::FUSE_NOTIFY_RESEND, ioslice_to_vec)
+            .unwrap();
+        let expected = vec![
+            0x10, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
         ];
         assert_eq!(n, expected);
