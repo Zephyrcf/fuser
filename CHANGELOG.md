@@ -1,6 +1,8 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add `BackgroundSession::is_finished()`, which tells without blocking whether the session has
+  ended, e.g. after a worker failed while the connection stayed alive
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount
   has no caller ids to report, so there is not always a uid. A filesystem that does not request
   `InitFlags::FUSE_ALLOW_IDMAP` is always given ids and can unwrap

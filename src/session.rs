@@ -675,6 +675,15 @@ impl BackgroundSession {
         self.join_impl()
     }
 
+    /// Returns whether the session thread has terminated, without blocking.
+    ///
+    /// Workers can exit with an error while other fds keep the connection
+    /// alive, so watching the fd alone cannot tell. Returns `false` once the
+    /// session has been joined.
+    pub fn is_finished(&self) -> bool {
+        self.guard.as_ref().is_some_and(|h| h.is_finished())
+    }
+
     fn join_impl(&mut self) -> io::Result<()> {
         let Some(guard) = self.guard.take() else {
             return Ok(());
