@@ -1,6 +1,16 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add hot-upgrade support (Linux only): a daemon can hand its live `/dev/fuse` connection to a
+  successor process without interrupting the mount. `SessionPauser` (from `Session::pauser()` /
+  `BackgroundSession::pauser()`) stops the workers at a request boundary and resumes them if the
+  takeover fails. The successor adopts the fd with `Session::from_initialized_fd()` and
+  `Session::init_state()`, starting parked with `Session::spawn_paused()` until the handoff
+  commits; the predecessor then retires with `BackgroundSession::finish_handoff()`, which leaves
+  the mount in place, and the successor later unmounts it with `unmount_path()`. The predecessor
+  must have been spawned with `Session::spawn()`, as `Session::run()` unmounts when it returns,
+  and must send the replies it still owes before exiting. Mounts using
+  `MountOption::AutoUnmount` cannot be handed off
 * Add `BackgroundSession::is_finished()`, which tells without blocking whether the session has
   ended, e.g. after a worker failed while the connection stayed alive
 * **Breaking:** `Request::uid()` and `Request::gid()` return `Option<u32>`. An idmapped mount

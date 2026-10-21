@@ -51,12 +51,16 @@ pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
 pub use crate::mnt::mount_options::Config;
 pub use crate::mnt::mount_options::MountOption;
+#[cfg(target_os = "linux")]
+pub use crate::mnt::unmount_path;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
 pub use crate::notify::PollNotifier;
 pub use crate::open_flags::OpenAccMode;
 pub use crate::open_flags::OpenFlags;
 pub use crate::passthrough::BackingId;
+#[cfg(target_os = "linux")]
+pub use crate::pause::SessionPauser;
 pub use crate::poll_events::PollEvents;
 pub use crate::rename_flags::RenameFlags;
 pub use crate::reply::ReplyAttr;
@@ -78,6 +82,8 @@ pub use crate::reply::ReplyWrite;
 pub use crate::reply::ReplyXattr;
 pub use crate::request_param::Request;
 pub use crate::session::BackgroundSession;
+#[cfg(target_os = "linux")]
+pub use crate::session::InitState;
 use crate::session::MAX_WRITE_SIZE;
 use crate::session::MIN_WRITE_SIZE;
 pub use crate::session::Session;
@@ -97,6 +103,8 @@ mod mnt;
 mod notify;
 mod open_flags;
 mod passthrough;
+#[cfg(target_os = "linux")]
+mod pause;
 mod poll_events;
 mod read_buf;
 mod rename_flags;

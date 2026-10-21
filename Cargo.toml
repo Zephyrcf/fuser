@@ -38,7 +38,7 @@ smallvec = "1.6.1"
 async-trait = { version = "0.1", optional = true }
 tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"], optional = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-nix = { version = "0.31.0", features = ["fs", "user", "poll", "socket", "uio", "mount", "process", "ioctl"] }
+nix = { version = "0.31.0", features = ["event", "fs", "user", "poll", "socket", "uio", "mount", "process", "ioctl"] }
 
 [dev-dependencies]
 env_logger = "0.11.7"
