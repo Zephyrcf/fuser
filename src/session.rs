@@ -31,8 +31,8 @@ use crate::MountOption;
 use crate::ReplyEmpty;
 use crate::Request;
 use crate::channel::Channel;
-use crate::channel::ChannelSender;
 use crate::dev_fuse::DevFuse;
+use crate::inflight::InflightJournal;
 use crate::ll;
 use crate::ll::Operation;
 use crate::ll::ResponseErrno;
@@ -43,6 +43,8 @@ use crate::mnt::Mount;
 use crate::mnt::mount_options::Config;
 use crate::mnt::mount_options::check_option_conflicts;
 use crate::notify::Notifier;
+#[cfg(target_os = "linux")]
+use crate::notify::RecoveryState;
 #[cfg(target_os = "linux")]
 use crate::pause::SessionPauser;
 use crate::read_buf::FuseReadBuf;
@@ -175,6 +177,8 @@ pub struct Session<FS: Filesystem> {
     /// session's fd off to a successor process during a hot upgrade.
     #[cfg(target_os = "linux")]
     pub(crate) pause: SessionPauser,
+    #[cfg(target_os = "linux")]
+    recovery: Arc<Mutex<RecoveryState>>,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -227,6 +231,8 @@ impl<FS: Filesystem> Session<FS> {
             config: options.clone(),
             #[cfg(target_os = "linux")]
             pause: SessionPauser::new()?,
+            #[cfg(target_os = "linux")]
+            recovery: Arc::default(),
         };
 
         session.handshake()?;
@@ -260,6 +266,8 @@ impl<FS: Filesystem> Session<FS> {
             config,
             #[cfg(target_os = "linux")]
             pause: SessionPauser::new()?,
+            #[cfg(target_os = "linux")]
+            recovery: Arc::default(),
         };
 
         session.handshake()?;
@@ -275,6 +283,10 @@ impl<FS: Filesystem> Session<FS> {
     /// with [`crate::unmount_path`]. Mounts using `MountOption::AutoUnmount`
     /// cannot be handed off. Spawn with [`Session::spawn_paused`] to keep the
     /// handoff reversible.
+    ///
+    /// After a crash rather than a pause, recover stranded requests with
+    /// [`crate::Notifier::recover_inflight`]; with `Config::clone_fd`, adopt every
+    /// device with [`Session::from_initialized_fds`].
     #[cfg(target_os = "linux")]
     pub fn from_initialized_fd(
         filesystem: FS,
@@ -300,7 +312,65 @@ impl<FS: Filesystem> Session<FS> {
             kernel_capabilities: init.kernel_capabilities,
             config,
             pause: SessionPauser::new()?,
+            recovery: Arc::default(),
         })
+    }
+
+    /// Like [`Session::from_initialized_fd`], but adopts every device exported
+    /// by [`Session::try_clone_fds`]: the main device first, then the cloned
+    /// worker devices. `config` must match the predecessor's `clone_fd` and
+    /// worker count.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] if the device count does not
+    /// match `config`.
+    #[cfg(target_os = "linux")]
+    pub fn from_initialized_fds(
+        filesystem: FS,
+        fds: Vec<OwnedFd>,
+        acl: SessionACL,
+        config: Config,
+        init: InitState,
+    ) -> io::Result<Self> {
+        let expected = if config.clone_fd {
+            config.n_threads.unwrap_or(1)
+        } else {
+            1
+        };
+        if fds.is_empty() || fds.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("expected {expected} FUSE devices, got {}", fds.len()),
+            ));
+        }
+        let mut fds = fds.into_iter();
+        let fd = fds.next().expect("nonempty device list");
+        let mut session = Self::from_initialized_fd(filesystem, fd, acl, config, init)?;
+        session.cloned_channels = fds
+            .map(|fd| Channel::new(Arc::new(DevFuse(File::from(fd)))))
+            .collect();
+        session.recovery.lock().reply_senders = session
+            .cloned_channels
+            .iter()
+            .map(Channel::sender)
+            .collect();
+        Ok(session)
+    }
+
+    /// Duplicates the main device followed by every cloned worker device, for a
+    /// failover holder to keep: a request read on a device can only be answered
+    /// on that device. Opens the clones if needed, without reading a request.
+    ///
+    /// # Errors
+    /// Returns an error if the worker configuration is invalid or a device
+    /// cannot be cloned or duplicated.
+    #[cfg(target_os = "linux")]
+    pub fn try_clone_fds(&mut self) -> io::Result<Vec<OwnedFd>> {
+        self.prepare_cloned_channels()?;
+        std::iter::once(&self.ch)
+            .chain(&self.cloned_channels)
+            .map(|ch| ch.as_fd().try_clone_to_owned())
+            .collect()
     }
 
     /// Returns the outcome of `FUSE_INIT`, which a successor adopting this
@@ -325,16 +395,61 @@ impl<FS: Filesystem> Session<FS> {
         self.pause.clone()
     }
 
+    /// Starts tracking the requests read but not yet answered in a journal
+    /// shared through the returned fd, so that a successor can recover them
+    /// with [`Notifier::recover_inflight`] if this process crashes. Hand the
+    /// fd to the failover holder, and the successor to
+    /// [`Session::adopt_inflight_journal`].
+    ///
+    /// Returns `None` if the kernel advertises `InitFlags::FUSE_HAS_RESEND`:
+    /// it recovers such requests by itself, so nothing is tracked.
+    ///
+    /// # Errors
+    /// Returns an error if the journal cannot be created.
+    #[cfg(target_os = "linux")]
+    pub fn create_inflight_journal(&mut self) -> io::Result<Option<OwnedFd>> {
+        if self.kernel_resends() {
+            return Ok(None);
+        }
+        let journal = InflightJournal::create()?;
+        let fd = journal.try_clone_fd()?;
+        self.recovery.lock().journal = Some(journal);
+        Ok(Some(fd))
+    }
+
+    /// Continues the journal of a crashed predecessor, from the fd that
+    /// [`Session::create_inflight_journal`] returned to it. Call this before
+    /// spawning, so that recovery finds the predecessor's requests.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] if the kernel can resend, where
+    /// no journal is created, or an error if `fd` holds no valid journal.
+    #[cfg(target_os = "linux")]
+    pub fn adopt_inflight_journal(&mut self, fd: OwnedFd) -> io::Result<()> {
+        if self.kernel_resends() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the kernel resends unanswered requests, so no journal is used",
+            ));
+        }
+        self.recovery.lock().journal = Some(InflightJournal::from_fd(fd)?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kernel_resends(&self) -> bool {
+        self.kernel_capabilities
+            .contains(InitFlags::FUSE_HAS_RESEND)
+    }
+
     /// Run the session loop in a background thread. If the returned handle is dropped,
     /// the filesystem is unmounted and the session is waited for, so that
     /// `Filesystem::destroy` has run when drop returns - except in the cases documented
     /// on [`BackgroundSession`], where the session thread is detached instead.
     pub fn spawn(mut self) -> io::Result<BackgroundSession> {
         self.prepare_cloned_channels()?;
-        let sender = self.ch.sender();
+        let notifier = self.notifier();
         let fuse_device = self.ch.device();
-        let kernel_capabilities = self.kernel_capabilities;
-        let kernel_abi = self.proto_version;
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut *self.mount.mount.lock());
         // Register before returning, so the handle never reports a running
@@ -354,11 +469,9 @@ impl<FS: Filesystem> Session<FS> {
         }
         Ok(BackgroundSession {
             guard: Some(guard?),
-            sender,
+            notifier,
             fuse_device,
             mount,
-            kernel_capabilities,
-            kernel_abi,
             #[cfg(target_os = "linux")]
             pauser,
         })
@@ -448,6 +561,8 @@ impl<FS: Filesystem> Session<FS> {
             self.cloned_channels = (1..n_threads)
                 .map(|_| self.ch.clone_fd())
                 .collect::<io::Result<_>>()?;
+            self.recovery.lock().reply_senders =
+                self.cloned_channels.iter().map(Channel::sender).collect();
         }
         Ok(())
     }
@@ -468,8 +583,14 @@ impl<FS: Filesystem> Session<FS> {
             config,
             #[cfg(target_os = "linux")]
             pause,
+            #[cfg(target_os = "linux")]
+            recovery,
         } = self;
 
+        #[cfg(target_os = "linux")]
+        let inflight_journal = recovery.lock().journal.clone();
+        #[cfg(not(target_os = "linux"))]
+        let inflight_journal: Option<InflightJournal> = None;
         let n_threads = config.n_threads.unwrap_or(1);
 
         let mut channels = if config.clone_fd {
@@ -497,6 +618,7 @@ impl<FS: Filesystem> Session<FS> {
                 kernel_abi: proto_version,
                 #[cfg(target_os = "linux")]
                 pause: pause.clone(),
+                inflight_journal: inflight_journal.clone(),
             };
             match thread::Builder::new()
                 .name(thread_name)
@@ -596,7 +718,7 @@ impl<FS: Filesystem> Session<FS> {
                     // Send error response and return error - non-init during handshake is invalid
                     <ReplyRaw as Reply>::new(
                         request.unique(),
-                        ReplySender::Channel(self.ch.sender()),
+                        ReplySender::Channel(self.ch.sender(), None),
                     )
                     .send_ll(&ResponseErrno(ll::Errno::EIO));
                     return Err(io::Error::new(
@@ -616,16 +738,22 @@ impl<FS: Filesystem> Session<FS> {
                     abi::FUSE_KERNEL_VERSION
                 );
                 let response = init.reply_version_only();
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&response);
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender(), None),
+                )
+                .send_ll(&response);
                 continue;
             }
 
             // We don't support ABI versions before 7.6
             if v < Version(7, 6) {
                 error!("Unsupported FUSE ABI version {v}");
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&ResponseErrno(ll::Errno::EPROTO));
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender(), None),
+                )
+                .send_ll(&ResponseErrno(ll::Errno::EPROTO));
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("Unsupported FUSE ABI version {v}"),
@@ -652,8 +780,11 @@ impl<FS: Filesystem> Session<FS> {
             let res = filesystem.init(Request::ref_cast(request.header()), &mut config);
             if let Err(error) = res {
                 let errno = Errno::from_i32(error.raw_os_error().unwrap_or(0));
-                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                    .send_ll(&ResponseErrno(errno));
+                <ReplyRaw as Reply>::new(
+                    request.unique(),
+                    ReplySender::Channel(self.ch.sender(), None),
+                )
+                .send_ll(&ResponseErrno(errno));
                 return Err(error);
             }
 
@@ -700,8 +831,11 @@ impl<FS: Filesystem> Session<FS> {
             );
 
             let response = init.reply(&config);
-            <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
-                .send_ll(&response);
+            <ReplyRaw as Reply>::new(
+                request.unique(),
+                ReplySender::Channel(self.ch.sender(), None),
+            )
+            .send_ll(&response);
 
             return Ok(());
         }
@@ -719,13 +853,17 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
-    /// Returns an object that can be used to send notifications to the kernel
+    /// Returns an object that can be used to send notifications to the kernel.
+    /// The handle observes subsequent journal and worker-device configuration.
     pub fn notifier(&self) -> Notifier {
-        Notifier::new(
+        let notifier = Notifier::new(
             self.ch.sender(),
             self.kernel_capabilities,
             self.proto_version,
-        )
+        );
+        #[cfg(target_os = "linux")]
+        let notifier = notifier.with_recovery(self.pause.clone(), self.recovery.clone());
+        notifier
     }
 }
 
@@ -759,6 +897,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     /// the session's fd off to a successor process during a hot upgrade.
     #[cfg(target_os = "linux")]
     pub(crate) pause: SessionPauser,
+    pub(crate) inflight_journal: Option<InflightJournal>,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
@@ -788,10 +927,31 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 return Ok(());
             }
 
+            let mut reservation = match &self.inflight_journal {
+                Some(journal) => match journal.reserve() {
+                    Ok(reservation) => Some(reservation),
+                    // Every slot holds an unanswered request: wait for a reply
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(buf) {
+            let received = match reservation.as_mut() {
+                Some(reservation) => reservation.receive(&self.ch, buf),
+                None => self.ch.receive(buf),
+            };
+            match received {
                 Ok(size) => {
-                    match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
+                    match RequestWithSender::new(
+                        self.ch.sender(),
+                        &buf[..size],
+                        self.negotiated,
+                        reservation,
+                    ) {
                         // Dispatch request
                         Some(req) => {
                             if let Ok(Operation::Destroy(_)) = req.request.operation() {
@@ -810,9 +970,13 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                         }
                     }
                 }
-                // No request is queued: wait for one, or for a pause/exit wakeup
+                // No request is queued: release the slot and wait for one, or
+                // for a pause/exit wakeup
                 #[cfg(target_os = "linux")]
-                Err(nix::errno::Errno::EAGAIN) => waiter.wait()?,
+                Err(nix::errno::Errno::EAGAIN) => {
+                    drop(reservation);
+                    waiter.wait()?;
+                }
                 // ENOENT: interrupted operation, safe to retry. EINTR:
                 // interrupted syscall.
                 Err(nix::errno::Errno::ENOENT) | Err(nix::errno::Errno::EINTR) => continue,
@@ -847,17 +1011,13 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
 pub struct BackgroundSession {
     /// Thread guard of the background session. None once joined.
     guard: Option<JoinHandle<io::Result<()>>>,
-    /// Object for creating Notifiers for client use
-    sender: ChannelSender,
+    /// Handed out by [`BackgroundSession::notifier`]. It also keeps every
+    /// cloned worker device open, including after its worker exits.
+    notifier: Notifier,
     /// The FUSE device fd of the session's kernel connection
     fuse_device: Arc<DevFuse>,
     /// Ensures the filesystem is unmounted when the session ends
     mount: Option<Mount>,
-    /// Everything the kernel advertised during init, for notifications whose support
-    /// depends on it
-    kernel_capabilities: InitFlags,
-    /// The ABI version agreed during init, for notifications with no capability bit
-    kernel_abi: Option<Version>,
     /// Pause/resume control over the worker loops, for handing the session's
     /// fd off to a successor process during a hot upgrade.
     #[cfg(target_os = "linux")]
@@ -892,11 +1052,7 @@ impl BackgroundSession {
 
     /// Returns an object that can be used to send notifications to the kernel
     pub fn notifier(&self) -> Notifier {
-        Notifier::new(
-            self.sender.clone(),
-            self.kernel_capabilities,
-            self.kernel_abi,
-        )
+        self.notifier.clone()
     }
 
     /// Join the filesystem thread without unmounting first: blocks until
@@ -1061,6 +1217,261 @@ mod test {
                 .arg(&mountpoint)
                 .status();
         }
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// Attributes of a directory, for test filesystems that serve getattr.
+    fn directory_attr(ino: crate::INodeNo) -> crate::FileAttr {
+        use std::time::SystemTime;
+
+        crate::FileAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind: crate::FileType::Directory,
+            perm: 0o777,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
+    }
+
+    /// A predecessor that crashed mid-request read requests off the connection that nothing
+    /// will ever answer. A successor adopting the connection asks for them back with
+    /// [`Notifier::resend`], and the kernel delivers them again with the resend mark set.
+    /// Pinned against a real kernel: the redelivery and the mark are its behavior.
+    #[test]
+    fn resend_redelivers_inflight_requests_to_a_successor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+
+        /// Reads the lookup and then hangs, standing in for a process that died with the
+        /// request in hand. Released at the end of the test so its worker can exit; the
+        /// answer it then sends belongs to a request the successor already completed, and
+        /// the kernel discards it.
+        struct Predecessor {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Predecessor {
+            fn lookup(
+                &self,
+                _req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                // Only the test's own lookup hangs: anything else probing the
+                // mountpoint (desktop indexers do) is answered right away,
+                // rather than wedging the single worker on it
+                if name != "inflight" {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.entered.send(()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        struct Successor {
+            saw_resend: Arc<Mutex<Option<bool>>>,
+        }
+        impl Filesystem for Successor {
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                if name == "inflight" {
+                    *self.saw_resend.lock() = Some(req.is_resend());
+                }
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let session = Session::new(
+            Predecessor {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap();
+
+        let init = session.init_state();
+        if !init
+            .kernel_capabilities
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            eprintln!(
+                "skipping resend_redelivers_inflight_requests_to_a_successor: kernel does not advertise FUSE_HAS_RESEND"
+            );
+            drop(session);
+            ManuallyDrop::into_inner(tmp);
+            return;
+        }
+
+        let successor_fd = session.as_fd().try_clone_to_owned().unwrap();
+        let predecessor = session.spawn().unwrap();
+
+        let client_path = mountpoint.join("inflight");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let saw_resend = Arc::new(Mutex::new(None));
+        let successor = Session::from_initialized_fd(
+            Successor {
+                saw_resend: saw_resend.clone(),
+            },
+            successor_fd,
+            SessionACL::All,
+            Config::default(),
+            init,
+        )
+        .unwrap()
+        .spawn()
+        .unwrap();
+        successor.notifier().resend().unwrap();
+
+        // The predecessor's worker is still stuck in lookup(), so this answer proves the
+        // kernel delivered the request a second time and the successor completed it
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the successor answers the resent lookup with ENOENT");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            *saw_resend.lock(),
+            Some(true),
+            "the redelivered request must carry the resend mark"
+        );
+
+        release_tx.send(()).unwrap();
+        predecessor.umount_and_join().unwrap();
+        successor.join().unwrap();
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// On a kernel too old for resend, a successor can still unblock the callers of
+    /// requests a dead predecessor read but never answered, by answering the journaled
+    /// request ids itself: the kernel matches a reply to a request by the id alone,
+    /// whoever writes it. Pinned against a real kernel: the matching is its behavior,
+    /// on every version.
+    #[test]
+    fn reply_error_completes_a_request_read_by_someone_else() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+
+        /// Journals the id of the lookup it reads and then hangs, standing in for a
+        /// process that died with the request in hand.
+        struct Journaling {
+            read: mpsc::Sender<ll::RequestId>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Journaling {
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                // Only the test's own lookup hangs: anything else probing the
+                // mountpoint (desktop indexers do) is answered right away,
+                // rather than wedging the single worker on it
+                if name != "stranded" {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.read.send(req.unique()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let bg = Session::new(
+            Journaling {
+                read: read_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &Config::default(),
+        )
+        .unwrap()
+        .spawn()
+        .unwrap();
+
+        let client_path = mountpoint.join("stranded");
+        let client = thread::spawn(move || std::fs::metadata(client_path));
+        let unique = read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // The worker is stuck in lookup(), so this answer is what unblocks the caller
+        bg.notifier().reply_error(unique, Errno::EIO).unwrap();
+        let err = client
+            .join()
+            .unwrap()
+            .expect_err("the reply by id answers the stranded lookup with EIO");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+
+        // The request is gone once answered, which is what a journal replayed after a
+        // crash sees for the entries the predecessor answered but did not strike
+        let err = bg.notifier().reply_error(unique, Errno::EIO).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        release_tx.send(()).unwrap();
+        bg.umount_and_join().unwrap();
         ManuallyDrop::into_inner(tmp);
     }
 
@@ -1289,6 +1700,128 @@ mod test {
                 .any(|l| l.split_whitespace().nth(1) == mountpoint.to_str()),
             "nothing must remain mounted after an abort"
         );
+        ManuallyDrop::into_inner(tmp);
+    }
+
+    /// Every worker holds a request, so recovery must find one on a cloned device.
+    /// Suppressing resend exercises the journal fallback on newer kernels too.
+    #[test]
+    fn recover_inflight_answers_the_journal_without_resend() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::INodeNo;
+        use crate::InflightRecovery;
+
+        struct Journaling {
+            read: mpsc::Sender<ll::RequestId>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Filesystem for Journaling {
+            // Without parallel dirops the kernel serializes lookups in one directory,
+            // so only one worker would ever hold a request.
+            fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+                let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+                Ok(())
+            }
+            fn lookup(
+                &self,
+                req: &Request,
+                _parent: INodeNo,
+                name: &std::ffi::OsStr,
+                reply: crate::ReplyEntry,
+            ) {
+                if !name.as_encoded_bytes().starts_with(b"stranded-") {
+                    return reply.error(Errno::ENOENT);
+                }
+                self.read.send(req.unique()).unwrap();
+                let _ = self.release.lock().recv();
+                reply.error(Errno::ENOENT);
+            }
+            fn getattr(
+                &self,
+                _req: &Request,
+                ino: INodeNo,
+                _fh: Option<crate::FileHandle>,
+                reply: crate::ReplyAttr,
+            ) {
+                reply.attr(&Duration::from_secs(0), &directory_attr(ino));
+            }
+        }
+
+        // Leak the directory on failure: it may still be a mountpoint
+        let tmp = ManuallyDrop::new(tempfile::tempdir().unwrap());
+        let mountpoint = tmp.path().canonicalize().unwrap();
+
+        let (read_tx, read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let config = Config {
+            n_threads: Some(2),
+            clone_fd: true,
+            ..Config::default()
+        };
+        let mut session = Session::new(
+            Journaling {
+                read: read_tx,
+                release: Mutex::new(release_rx),
+            },
+            &mountpoint,
+            &config,
+        )
+        .unwrap();
+
+        session
+            .kernel_capabilities
+            .remove(InitFlags::FUSE_HAS_RESEND);
+        let init = session.init_state();
+        let journal_fd = session.create_inflight_journal().unwrap().unwrap();
+        let imported = InflightJournal::from_fd(journal_fd.try_clone().unwrap()).unwrap();
+        let devices = session.try_clone_fds().unwrap();
+        assert_eq!(devices.len(), 2);
+        let bg = session.spawn().unwrap();
+
+        let clients: Vec<_> = (0..2)
+            .map(|i| {
+                let path = mountpoint.join(format!("stranded-{i}"));
+                thread::spawn(move || std::fs::metadata(path))
+            })
+            .collect();
+        let pending: Vec<_> = (0..2)
+            .map(|_| read_rx.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+
+        let mut successor =
+            Session::from_initialized_fds(AbortErrorFs, devices, SessionACL::Owner, config, init)
+                .unwrap();
+        successor.adopt_inflight_journal(journal_fd).unwrap();
+        let successor = successor.spawn_paused(Duration::from_secs(10)).unwrap();
+        let recovery = successor.notifier().recover_inflight(Errno::EIO).unwrap();
+        assert_eq!(recovery, InflightRecovery::ErroredOut(2));
+
+        for client in clients {
+            let err = client
+                .join()
+                .unwrap()
+                .expect_err("the fallback answers the stranded lookup with EIO");
+            assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        }
+        for unique in pending {
+            assert_eq!(
+                successor
+                    .notifier()
+                    .reply_error(unique, Errno::EIO)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+        }
+        assert_eq!(imported.pending_requests().unwrap(), []);
+        successor.pauser().exit();
+        successor.join().unwrap();
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        bg.umount_and_join().unwrap();
         ManuallyDrop::into_inner(tmp);
     }
 

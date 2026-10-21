@@ -1,6 +1,19 @@
 # FUSE for Rust - Changelog
 
 ## Unreleased
+* Add crash-failover support (Linux only) to complement hot upgrades. A successor can unblock
+  the callers of requests a crashed predecessor read but never answered with
+  `Notifier::recover_inflight()`: it asks the kernel to resend them (kernel 6.9+,
+  `InitFlags::FUSE_HAS_RESEND`) or, on older kernels, answers every id recorded in an
+  inflight journal with an error for the caller to retry. `Session::create_inflight_journal()`
+  starts that journal only where the kernel cannot resend, returning its fd for the successor's
+  `Session::adopt_inflight_journal()`. The successor also adopts every device from
+  `Session::try_clone_fds()` with `Session::from_initialized_fds()`. Also adds
+  `Notifier::resend()`, `Notifier::reply_error()` and `Request::is_resend()`; a resent request
+  may have run once already. `KernelConfig::add_capabilities()` no longer refuses
+  `InitFlags::FUSE_HAS_RESEND`, which the kernel only advertises and never reads back.
+  Journal recovery prevents workers from resuming until it finishes, and existing notifiers
+  observe subsequent journal and worker-device configuration
 * Add hot-upgrade support (Linux only): a daemon can hand its live `/dev/fuse` connection to a
   successor process without interrupting the mount. `SessionPauser` (from `Session::pauser()` /
   `BackgroundSession::pauser()`) stops the workers at a request boundary and resumes them if the

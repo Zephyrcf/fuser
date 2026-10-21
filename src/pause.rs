@@ -130,7 +130,7 @@ impl SessionPauser {
     }
 
     /// Restarts the paused worker loops on the same fds. A no-op unless the
-    /// session is paused.
+    /// session is paused. Waits for an ongoing journal recovery to finish.
     pub fn resume(&self) {
         self.resume_locked(&mut self.inner.state.lock());
     }
@@ -232,6 +232,21 @@ impl SessionPauser {
         let mut state = self.inner.state.lock();
         state.workers = state.workers.saturating_sub(count);
         self.inner.condvar.notify_all();
+    }
+
+    /// Runs `operation` without allowing workers to start or resume.
+    pub(crate) fn with_quiescent_workers<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let state = self.inner.state.lock();
+        if state.workers != 0 && (state.mode != RunMode::Paused || state.parked != state.workers) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "inflight recovery requires the session workers to be parked",
+            ));
+        }
+        operation()
     }
 
     /// Deregistration guard for one worker loop; dropping it (worker exit)
@@ -505,5 +520,23 @@ mod tests {
         let err = pauser.pause(Duration::from_millis(100)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(mode(&pauser), RunMode::Running);
+    }
+
+    #[test]
+    fn quiescent_operations_require_workers_to_be_absent_or_parked() {
+        let pauser = SessionPauser::new().unwrap();
+        pauser.with_quiescent_workers(|| Ok(())).unwrap();
+        let (_iterations, threads) = spawn_workers(&pauser, 2);
+        assert_eq!(
+            pauser.with_quiescent_workers(|| Ok(())).unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy
+        );
+        pauser.pause(Duration::from_secs(5)).unwrap();
+        pauser.with_quiescent_workers(|| Ok(())).unwrap();
+        pauser.exit();
+        for t in threads {
+            t.join().unwrap();
+        }
+        pauser.with_quiescent_workers(|| Ok(())).unwrap();
     }
 }

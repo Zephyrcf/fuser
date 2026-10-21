@@ -17,6 +17,8 @@ use crate::PollNotifier;
 use crate::Request;
 use crate::channel::ChannelSender;
 use crate::forget_one::ForgetOne;
+use crate::inflight::InflightRequest;
+use crate::inflight::InflightReservation;
 use crate::ll;
 use crate::ll::Errno;
 use crate::ll::ResponseData;
@@ -47,6 +49,7 @@ pub(crate) struct RequestWithSender<'a> {
     /// letting an idmapping that lands on uid 0 pass a check for root. They reach the
     /// filesystem as an `Owner` argument instead, and the caller reads as unknown here
     masked_header: Option<fuse_in_header>,
+    inflight: Option<InflightRequest>,
 }
 
 impl<'a> RequestWithSender<'a> {
@@ -55,6 +58,7 @@ impl<'a> RequestWithSender<'a> {
         ch: ChannelSender,
         data: &'a [u8],
         negotiated: InitFlags,
+        reservation: Option<InflightReservation>,
     ) -> Option<RequestWithSender<'a>> {
         let mut request = match ll::AnyRequest::try_from(data) {
             Ok(request) => request,
@@ -73,11 +77,13 @@ impl<'a> RequestWithSender<'a> {
                     gid: crate::FUSE_INVALID_UIDGID,
                     ..request.header().clone()
                 });
+        let inflight = reservation.map(|reservation| reservation.publish(request.unique()));
 
         Some(Self {
             ch,
             request,
             masked_header,
+            inflight,
         })
     }
 
@@ -158,6 +164,7 @@ impl<'a> RequestWithSender<'a> {
             }
             ll::Operation::Forget(x) => {
                 filesystem.forget(self.request_header(), self.request.nodeid(), x.nlookup()); // no reply
+                self.complete_without_reply();
             }
             ll::Operation::GetAttr(_attr) => {
                 filesystem.getattr(
@@ -345,7 +352,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectory::new(
                         self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
+                        self.reply_sender(),
                         x.size() as usize,
                     ),
                 );
@@ -515,6 +522,7 @@ impl<'a> RequestWithSender<'a> {
                     self.request_header(),
                     ForgetOne::slice_from_inner(x.nodes()),
                 ); // no reply
+                self.complete_without_reply();
             }
             ll::Operation::FAllocate(x) => {
                 filesystem.fallocate(
@@ -535,7 +543,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
+                        self.reply_sender(),
                         x.size() as usize,
                     ),
                 );
@@ -668,7 +676,17 @@ impl<'a> RequestWithSender<'a> {
     }
 
     pub(crate) fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), ReplySender::Channel(self.ch.clone()))
+        Reply::new(self.request.unique(), self.reply_sender())
+    }
+
+    fn reply_sender(&self) -> ReplySender {
+        ReplySender::Channel(self.ch.clone(), self.inflight.clone())
+    }
+
+    fn complete_without_reply(&self) {
+        if let Some(inflight) = &self.inflight {
+            inflight.complete();
+        }
     }
 
     /// Returns a Request reference for this request

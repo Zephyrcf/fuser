@@ -3,10 +3,19 @@ use std::convert::TryInto;
 #[allow(unused)]
 use std::ffi::OsStr;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+
+#[cfg(target_os = "linux")]
+use parking_lot::Mutex;
 
 use crate::INodeNo;
 use crate::Version;
 use crate::channel::ChannelSender;
+#[cfg(target_os = "linux")]
+use crate::inflight::InflightJournal;
+use crate::ll::Errno;
+use crate::ll::ResponseErrno;
 use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi::FUSE_EXPIRE_ONLY;
 use crate::ll::fuse_abi::FUSE_KERNEL_MINOR_VERSION;
@@ -14,6 +23,23 @@ use crate::ll::fuse_abi::FUSE_KERNEL_VERSION;
 use crate::ll::fuse_abi::FUSE_NOTIFY_INC_EPOCH_VERSION;
 use crate::ll::fuse_abi::fuse_notify_code as notify_code;
 use crate::ll::notify::Notification;
+use crate::ll::reply::Response;
+#[cfg(target_os = "linux")]
+use crate::pause::SessionPauser;
+
+/// How [`Notifier::recover_inflight`] unblocked the callers of the requests a dead
+/// predecessor read but never answered.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightRecovery {
+    /// The kernel redelivers every such request itself, to be served normally; nothing
+    /// was lost. Requests may reach the filesystem twice, marked with
+    /// [`Request::is_resend`](crate::Request::is_resend).
+    Resent,
+    /// The kernel is too old to resend, so the journaled requests were answered with an
+    /// error instead, this many of them still being open. The callers unblock and retry.
+    ErroredOut(usize),
+}
 
 /// A handle to a pending `poll()` request.
 #[derive(Copy, Clone, Debug)]
@@ -59,6 +85,14 @@ impl std::fmt::Debug for PollNotifier {
     }
 }
 
+/// Session setup shared with notifiers issued before configuration is complete.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryState {
+    pub(crate) reply_senders: Vec<ChannelSender>,
+    pub(crate) journal: Option<InflightJournal>,
+}
+
 /// A handle by which the application can send notifications to the server
 #[derive(Debug, Clone)]
 pub struct Notifier {
@@ -72,6 +106,9 @@ pub struct Notifier {
     /// version is what says whether the kernel will understand them. This is what the kernel
     /// advertised, not what the connection settled on: see [`Notifier::negotiated_abi`]
     kernel_abi: Option<Version>,
+    /// Recovery locks the configuration before locking the worker state.
+    #[cfg(target_os = "linux")]
+    recovery: Option<(SessionPauser, Arc<Mutex<RecoveryState>>)>,
 }
 
 impl Notifier {
@@ -84,7 +121,51 @@ impl Notifier {
             sender: cs,
             kernel_capabilities,
             kernel_abi,
+            #[cfg(target_os = "linux")]
+            recovery: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_recovery(
+        mut self,
+        pauser: SessionPauser,
+        state: Arc<Mutex<RecoveryState>>,
+    ) -> Self {
+        self.recovery = Some((pauser, state));
+        self
+    }
+
+    /// Completes an outstanding request with `error`, identified by its id
+    /// alone, on whichever of the session's devices read it. This lets a
+    /// successor unblock the callers of requests a crashed predecessor read.
+    ///
+    /// # Errors
+    /// Returns `ENOENT` if no device has the request in flight, i.e. it was
+    /// already answered, or an error if the kernel rejects the reply.
+    pub fn reply_error(&self, unique: crate::RequestId, error: Errno) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some((_, state)) = &self.recovery {
+            return self.reply_error_on(&state.lock().reply_senders, unique, error);
+        }
+        self.reply_error_on(&[], unique, error)
+    }
+
+    fn reply_error_on(
+        &self,
+        reply_senders: &[ChannelSender],
+        unique: crate::RequestId,
+        error: Errno,
+    ) -> io::Result<()> {
+        ResponseErrno(error).with_iovec(unique, |iov| {
+            for sender in std::iter::once(&self.sender).chain(reply_senders) {
+                match sender.send(iov) {
+                    Err(err) if err.raw_os_error() == Some(libc::ENOENT) => continue,
+                    result => return result,
+                }
+            }
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        })
     }
 
     /// Notify poll clients of I/O readiness
@@ -160,8 +241,79 @@ impl Notifier {
         {
             return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
         }
-        let notif = Notification::new_inc_epoch();
+        let notif = Notification::new_bare();
         self.send(notify_code::FUSE_NOTIFY_INC_EPOCH, &notif)
+    }
+
+    /// Asks the kernel to deliver again every request it handed out but has not
+    /// had answered, e.g. those a crashed predecessor read. They come back
+    /// marked by [`Request::is_resend`](crate::Request::is_resend) and may have
+    /// been acted on once already.
+    ///
+    /// # Errors
+    /// Returns `ENOTSUP` if the kernel did not advertise
+    /// `InitFlags::FUSE_HAS_RESEND` (kernel 6.9+), or an error if the kernel
+    /// rejects the notification.
+    pub fn resend(&self) -> io::Result<()> {
+        if !self
+            .kernel_capabilities
+            .contains(InitFlags::FUSE_HAS_RESEND)
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+        let notif = Notification::new_bare();
+        self.send(notify_code::FUSE_NOTIFY_RESEND, &notif)
+    }
+
+    /// Unblocks the callers of every request a crashed predecessor read but
+    /// never answered: asks the kernel to [`resend`](Self::resend) them where it
+    /// can, and otherwise answers each id in the session's inflight journal
+    /// with `error` (see
+    /// [`Session::create_inflight_journal`](crate::Session::create_inflight_journal)).
+    /// The journal is cleared once that succeeds and kept on failure, so
+    /// retrying is safe.
+    ///
+    /// Call this while the session's workers are parked, e.g. after
+    /// [`Session::spawn_paused`](crate::Session::spawn_paused) and before
+    /// resuming them. A resend also redelivers the requests running workers
+    /// hold, which would then run twice; with a journal attached, running
+    /// workers are refused outright. Journal recovery prevents this session's
+    /// workers from starting or resuming until it finishes.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::ResourceBusy`] if a journal is attached while the
+    /// workers run, [`io::ErrorKind::InvalidInput`] if the kernel cannot resend
+    /// and no journal is attached, or the error of a rejected notification or
+    /// reply.
+    #[cfg(target_os = "linux")]
+    pub fn recover_inflight(&self, error: Errno) -> io::Result<InflightRecovery> {
+        match self.resend() {
+            Ok(()) => return Ok(InflightRecovery::Resent),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
+            Err(e) => return Err(e),
+        }
+        let missing_journal = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inflight recovery requires a journal when resend is unavailable",
+            )
+        };
+        let (pauser, state) = self.recovery.as_ref().ok_or_else(missing_journal)?;
+        let state = state.lock();
+        let journal = state.journal.as_ref().ok_or_else(missing_journal)?;
+        pauser.with_quiescent_workers(|| {
+            let mut open = 0;
+            for unique in journal.pending_requests()? {
+                match self.reply_error_on(&state.reply_senders, unique, error) {
+                    Ok(()) => open += 1,
+                    // Answered by the predecessor but not struck before the crash
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            journal.clear();
+            Ok(InflightRecovery::ErroredOut(open))
+        })
     }
 
     /// What the connection actually speaks: the lower of what the kernel offered during init
@@ -273,6 +425,102 @@ mod test {
         notifier(InitFlags::FUSE_HAS_EXPIRE_ONLY)
             .expire_entry(INodeNo::ROOT, OsStr::new("x"))
             .unwrap();
+    }
+
+    /// A kernel that never advertised resending has no handler for the notification and
+    /// answers `EINVAL`, so the request is refused here with something more telling.
+    #[test]
+    fn resend_refused_without_kernel_support() {
+        let err = notifier(InitFlags::empty()).resend().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTSUP));
+    }
+
+    #[test]
+    fn resend_sent_with_kernel_support() {
+        notifier(InitFlags::FUSE_HAS_RESEND).resend().unwrap();
+    }
+
+    /// Attaches `journal` as a session with no running workers would.
+    #[cfg(target_os = "linux")]
+    fn with_journal(notifier: Notifier, journal: &InflightJournal) -> Notifier {
+        notifier.with_recovery(
+            SessionPauser::new().unwrap(),
+            Arc::new(Mutex::new(RecoveryState {
+                journal: Some(journal.clone()),
+                ..RecoveryState::default()
+            })),
+        )
+    }
+
+    /// A kernel that resends handles everything itself: no journal is needed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recover_inflight_resends_where_the_kernel_can() {
+        let recovery = notifier(InitFlags::FUSE_HAS_RESEND)
+            .recover_inflight(Errno::EIO)
+            .unwrap();
+        assert_eq!(recovery, InflightRecovery::Resent);
+    }
+
+    /// Without resend the journal is what there is; nothing journaled means nothing
+    /// to answer, and the count says so.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recover_inflight_falls_back_to_the_journal() {
+        let journal = InflightJournal::create().unwrap();
+        let recovery = with_journal(notifier(InitFlags::empty()), &journal)
+            .recover_inflight(Errno::EIO)
+            .unwrap();
+        assert_eq!(recovery, InflightRecovery::ErroredOut(0));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recover_inflight_requires_a_journal_without_resend() {
+        let error = notifier(InitFlags::empty())
+            .recover_inflight(Errno::EIO)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recover_inflight_refuses_a_journal_while_workers_run() {
+        let pauser = SessionPauser::new().unwrap();
+        pauser.register_workers(1);
+        let journal = InflightJournal::create().unwrap();
+        let error = notifier(InitFlags::empty())
+            .with_recovery(
+                pauser,
+                Arc::new(Mutex::new(RecoveryState {
+                    journal: Some(journal),
+                    ..RecoveryState::default()
+                })),
+            )
+            .recover_inflight(Errno::EIO)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn recovery_keeps_the_journal_on_reply_failure() {
+        let journal = InflightJournal::create().unwrap();
+        journal.reserve().unwrap().publish(crate::RequestId(42));
+        let full = Channel::new(Arc::new(DevFuse(
+            File::options().write(true).open("/dev/full").unwrap(),
+        )));
+        let notifier = Notifier::new(full.sender(), InitFlags::empty(), Some(Version(7, 31)))
+            .with_recovery(
+                SessionPauser::new().unwrap(),
+                Arc::new(Mutex::new(RecoveryState {
+                    reply_senders: vec![notifier(InitFlags::empty()).sender],
+                    journal: Some(journal.clone()),
+                })),
+            );
+        let error = notifier.recover_inflight(Errno::EIO).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(journal.pending_requests().unwrap(), [crate::RequestId(42)]);
     }
 
     /// Invalidating is unconditional: it does not depend on the expire capability.
